@@ -617,6 +617,67 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // K2. TEE / Keystore Attestation(Phase E) — ghost spoof 的天花板。
+        //     生成 EC key 并请求硬件 attestation,parse cert chain 拿 TEE-enforced
+        //     Build IDs(brand/device/manufacturer/model/product/serial)。这些字段
+        //     由 TEE 硬件密钥签名,ghost 无法 hook → 跟 Java Build.* 跨源不一致 = anchor。
+        //     OEM keybox 攻法 / TrickyStore 等可绕,但绝大多数场景下直接暴露真值。
+        // ============================================================
+        category("tee-attestation") {
+            val tee = collectKeystoreAttestation()
+            field("tee.supported",
+                "EC + setAttestationChallenge" jLayer {
+                    when {
+                        tee == null -> "false (attestation API failed)"
+                        tee.error != null -> "false (${tee.error})"
+                        else -> "true"
+                    }
+                },
+            )
+            if (tee != null && tee.error == null) {
+                field("tee.cert_chain.length",
+                    "X509 chain size" jLayer { tee.chainLength.toString() },
+                )
+                field("tee.attestation_security_level",
+                    "AttestationExtension byte[1]" jLayer { tee.attestationSecurityLevel },
+                )
+                field("tee.keymaster_security_level",
+                    "AttestationExtension keymaster level" jLayer { tee.keymasterSecurityLevel },
+                )
+                field("tee.attestation_version",
+                    "AttestationExtension version" jLayer { tee.attestationVersion?.toString() },
+                )
+                field("tee.keymaster_version",
+                    "AttestationExtension km version" jLayer { tee.keymasterVersion?.toString() },
+                )
+                // ★★★ 关键:TEE-enforced Build IDs 跟 Java Build.* 跨源对比 ★★★
+                field("tee.id.brand vs Build.BRAND",
+                    "Build.BRAND" jLayer { Build.BRAND },
+                    "TEE hw-enforced attestationIdBrand[710]" jLayer { tee.idBrand },
+                )
+                field("tee.id.device vs Build.DEVICE",
+                    "Build.DEVICE" jLayer { Build.DEVICE },
+                    "TEE hw-enforced attestationIdDevice[711]" jLayer { tee.idDevice },
+                )
+                field("tee.id.product vs Build.PRODUCT",
+                    "Build.PRODUCT" jLayer { Build.PRODUCT },
+                    "TEE hw-enforced attestationIdProduct[712]" jLayer { tee.idProduct },
+                )
+                field("tee.id.manufacturer vs Build.MANUFACTURER",
+                    "Build.MANUFACTURER" jLayer { Build.MANUFACTURER },
+                    "TEE hw-enforced attestationIdManufacturer[716]" jLayer { tee.idManufacturer },
+                )
+                field("tee.id.model vs Build.MODEL",
+                    "Build.MODEL" jLayer { Build.MODEL },
+                    "TEE hw-enforced attestationIdModel[717]" jLayer { tee.idModel },
+                )
+                field("tee.id.serial",
+                    "TEE hw-enforced attestationIdSerial[713]" jLayer { tee.idSerial },
+                )
+            }
+        }
+
+        // ============================================================
         // L. 设备指纹 ID(Phase A) — 商业风控 SDK(同盾/数美/瑞数)用作 deviceId 原子 ID。
         //    ghost 应该给每个 UID/session 分别 spoof,verify 跨调用对比看稳定性。
         // ============================================================
@@ -987,6 +1048,226 @@ class GhostCollector(private val context: Context) {
         status.lineSequence().firstOrNull { it.startsWith("TracerPid:") }
             ?.substringAfter(":")?.trim()?.toIntOrNull()
     }.getOrNull()
+
+    // ========================================================================
+    // Phase E — Keystore TEE Attestation
+    // ========================================================================
+    private data class KeystoreAttestation(
+        val chainLength: Int = 0,
+        val attestationVersion: Int? = null,
+        val attestationSecurityLevel: String? = null,
+        val keymasterVersion: Int? = null,
+        val keymasterSecurityLevel: String? = null,
+        val idBrand: String? = null,
+        val idDevice: String? = null,
+        val idProduct: String? = null,
+        val idSerial: String? = null,
+        val idManufacturer: String? = null,
+        val idModel: String? = null,
+        val error: String? = null,
+    )
+
+    private fun collectKeystoreAttestation(): KeystoreAttestation? {
+        return runCatching {
+            val challenge = ByteArray(16).apply { java.security.SecureRandom().nextBytes(this) }
+            val alias = "ghost_verify_attest_${System.currentTimeMillis() % 1_000_000}"
+            val ks = java.security.KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            runCatching { ks.deleteEntry(alias) }
+
+            val kpg = java.security.KeyPairGenerator.getInstance(
+                android.security.keystore.KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+
+            // 优先请求 ID attestation(API 31+ Android 12)— TEE 在 attestation
+            // extension 的 hardwareEnforced 区段加入 brand/device/manufacturer/model
+            // 等 Build IDs(对比 Java Build.* 暴露 spoof 的关键检测点)。
+            // 不是所有硬件都支持 ID attestation(Pixel 全系列支持;Samsung 部分支持),
+            // 失败 fallback 到普通 attestation。
+            fun buildSpec(includeIds: Boolean): android.security.keystore.KeyGenParameterSpec {
+                val b = android.security.keystore.KeyGenParameterSpec.Builder(
+                    alias, android.security.keystore.KeyProperties.PURPOSE_SIGN)
+                    .setAlgorithmParameterSpec(java.security.spec.ECGenParameterSpec("secp256r1"))
+                    .setDigests(android.security.keystore.KeyProperties.DIGEST_SHA256)
+                    .setAttestationChallenge(challenge)
+                if (includeIds && Build.VERSION.SDK_INT >= 31) {
+                    runCatching { b.setDevicePropertiesAttestationIncluded(true) }
+                }
+                return b.build()
+            }
+            try {
+                kpg.initialize(buildSpec(includeIds = true))
+                kpg.generateKeyPair()
+            } catch (e: Throwable) {
+                // ID attestation 不支持,fallback 到普通 attestation
+                runCatching { ks.deleteEntry(alias) }
+                kpg.initialize(buildSpec(includeIds = false))
+                kpg.generateKeyPair()
+            }
+
+            val chain = ks.getCertificateChain(alias)
+                ?: return@runCatching KeystoreAttestation(error = "no cert chain")
+            val leaf = chain[0] as java.security.cert.X509Certificate
+            // OID 1.3.6.1.4.1.11129.2.1.17 = Google KeyDescription extension
+            val rawWrapped = leaf.getExtensionValue("1.3.6.1.4.1.11129.2.1.17")
+                ?: return@runCatching KeystoreAttestation(chainLength = chain.size,
+                    error = "no attestation extension(non-TEE root chain)")
+
+            // getExtensionValue 返回 ASN.1 OCTET STRING wrapped 的 raw bytes
+            // 拆开外层 OCTET STRING(tag 0x04)拿内层 SEQUENCE
+            val inner = unwrapOctetString(rawWrapped)
+            val parsed = parseAttestationExtension(inner)
+
+            runCatching { ks.deleteEntry(alias) }
+            parsed.copy(chainLength = chain.size)
+        }.getOrElse { t ->
+            KeystoreAttestation(error = "${t.javaClass.simpleName}: ${t.message?.take(60)}")
+        }
+    }
+
+    /** ASN.1 OCTET STRING unwrap:0x04 [len] [inner...] → 返回 inner */
+    private fun unwrapOctetString(data: ByteArray): ByteArray {
+        if (data.isEmpty() || data[0].toInt() and 0xFF != 0x04) return data
+        var idx = 1
+        val len = readBerLength(data, idx); idx = len.second
+        return data.copyOfRange(idx, idx + len.first)
+    }
+
+    /** 读 BER length(short form < 128 直接,long form 第一字节高位 1 + 后续字节数);返回 (len, nextIdx) */
+    private fun readBerLength(data: ByteArray, idx: Int): Pair<Int, Int> {
+        val b = data[idx].toInt() and 0xFF
+        if (b < 0x80) return b to (idx + 1)
+        val nBytes = b and 0x7F
+        var v = 0
+        for (i in 1..nBytes) v = (v shl 8) or (data[idx + i].toInt() and 0xFF)
+        return v to (idx + 1 + nBytes)
+    }
+
+    /**
+     * Parse AttestationExtension SEQUENCE:
+     *   { INT version, ENUM attestationLevel, INT kmVersion, ENUM kmLevel,
+     *     OCTET challenge, OCTET uniqueId, SEQ softwareEnforced, SEQ hardwareEnforced }
+     * 然后扫 hardwareEnforced 找 [710]/[711]/[712]/[713]/[716]/[717] EXPLICIT OCTET STRING
+     */
+    private fun parseAttestationExtension(seq: ByteArray): KeystoreAttestation {
+        // 顶层 SEQUENCE(0x30)
+        if (seq.isEmpty() || (seq[0].toInt() and 0xFF) != 0x30) {
+            return KeystoreAttestation(error = "not SEQUENCE")
+        }
+        var idx = 1
+        val (totalLen, contentStart) = readBerLength(seq, idx)
+        idx = contentStart
+        val end = idx + totalLen
+
+        // 1. attestationVersion INTEGER
+        val (attVer, p1) = readInt(seq, idx); idx = p1
+        // 2. attestationSecurityLevel ENUMERATED
+        val (attLvl, p2) = readEnum(seq, idx); idx = p2
+        // 3. keymasterVersion INTEGER
+        val (kmVer, p3) = readInt(seq, idx); idx = p3
+        // 4. keymasterSecurityLevel ENUMERATED
+        val (kmLvl, p4) = readEnum(seq, idx); idx = p4
+        // 5. attestationChallenge OCTET STRING(skip)
+        idx = skipOne(seq, idx)
+        // 6. uniqueId OCTET STRING(skip)
+        idx = skipOne(seq, idx)
+        // 7. softwareEnforced SEQUENCE(skip)
+        idx = skipOne(seq, idx)
+        // 8. hardwareEnforced SEQUENCE — 扫这个找 hw-enforced Build IDs
+
+        if (idx >= end || (seq[idx].toInt() and 0xFF) != 0x30) {
+            return KeystoreAttestation(
+                attestationVersion = attVer, attestationSecurityLevel = securityLevelName(attLvl),
+                keymasterVersion = kmVer, keymasterSecurityLevel = securityLevelName(kmLvl),
+                error = "no hardwareEnforced")
+        }
+        idx++  // skip SEQ tag
+        val (hwLen, hwContentStart) = readBerLength(seq, idx)
+        idx = hwContentStart
+        val hwEnd = idx + hwLen
+
+        // 扫 hardwareEnforced 找 [710]/[711]/[712]/[713]/[716]/[717] EXPLICIT OCTET STRING
+        // Tag bytes for context-constructed [tag]:
+        //   tag 710 = 0xBF 0x85 0x46
+        //   tag 711 = 0xBF 0x85 0x47
+        //   tag 712 = 0xBF 0x85 0x48
+        //   tag 713 = 0xBF 0x85 0x49
+        //   tag 716 = 0xBF 0x85 0x4C
+        //   tag 717 = 0xBF 0x85 0x4D
+        var brand: String? = null; var device: String? = null; var product: String? = null
+        var serial: String? = null; var manufacturer: String? = null; var model: String? = null
+        while (idx < hwEnd) {
+            val b0 = seq[idx].toInt() and 0xFF
+            if (b0 == 0xBF && idx + 2 < hwEnd && (seq[idx + 1].toInt() and 0xFF) == 0x85) {
+                val tag = seq[idx + 2].toInt() and 0xFF
+                idx += 3
+                val (oLen, oCS) = readBerLength(seq, idx); idx = oCS
+                val outerEnd = idx + oLen
+                // EXPLICIT OCTET STRING:inner 0x04 + len + bytes
+                if (idx < outerEnd && (seq[idx].toInt() and 0xFF) == 0x04) {
+                    idx++
+                    val (iLen, iCS) = readBerLength(seq, idx); idx = iCS
+                    val v = String(seq, idx, iLen, Charsets.UTF_8)
+                    when (tag) {
+                        0x46 -> brand = v   // 710
+                        0x47 -> device = v  // 711
+                        0x48 -> product = v // 712
+                        0x49 -> serial = v  // 713
+                        0x4C -> manufacturer = v  // 716
+                        0x4D -> model = v   // 717
+                    }
+                    idx += iLen
+                } else {
+                    idx = outerEnd
+                }
+            } else {
+                idx = skipOne(seq, idx)
+            }
+        }
+        return KeystoreAttestation(
+            attestationVersion = attVer,
+            attestationSecurityLevel = securityLevelName(attLvl),
+            keymasterVersion = kmVer,
+            keymasterSecurityLevel = securityLevelName(kmLvl),
+            idBrand = brand, idDevice = device, idProduct = product,
+            idSerial = serial, idManufacturer = manufacturer, idModel = model,
+        )
+    }
+
+    private fun readInt(d: ByteArray, idx0: Int): Pair<Int, Int> {
+        if ((d[idx0].toInt() and 0xFF) != 0x02) return 0 to skipOne(d, idx0)
+        var idx = idx0 + 1
+        val (len, cs) = readBerLength(d, idx); idx = cs
+        var v = 0
+        for (i in 0 until len) v = (v shl 8) or (d[idx + i].toInt() and 0xFF)
+        return v to (idx + len)
+    }
+
+    private fun readEnum(d: ByteArray, idx0: Int): Pair<Int, Int> {
+        if ((d[idx0].toInt() and 0xFF) != 0x0A) return 0 to skipOne(d, idx0)
+        var idx = idx0 + 1
+        val (len, cs) = readBerLength(d, idx); idx = cs
+        var v = 0
+        for (i in 0 until len) v = (v shl 8) or (d[idx + i].toInt() and 0xFF)
+        return v to (idx + len)
+    }
+
+    /** skip 一个 TLV(任意 type),返回下一个位置 */
+    private fun skipOne(d: ByteArray, idx0: Int): Int {
+        var idx = idx0 + 1
+        // 处理 multi-byte tag(高位 1 字节)
+        if ((d[idx0].toInt() and 0x1F) == 0x1F) {
+            while (idx < d.size && (d[idx].toInt() and 0x80) != 0) idx++
+            idx++  // last tag byte
+        }
+        val (len, cs) = readBerLength(d, idx)
+        return cs + len
+    }
+
+    private fun securityLevelName(v: Int): String = when (v) {
+        0 -> "Software"
+        1 -> "TrustedEnvironment(TEE)"
+        2 -> "StrongBox"
+        else -> "unknown($v)"
+    }
 
     private fun detectEmulator(): String {
         val hits = mutableListOf<String>()
