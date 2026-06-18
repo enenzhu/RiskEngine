@@ -134,10 +134,16 @@ class GhostCollector(private val context: Context) {
                 "gsm.version.baseband" nLayer { NativeBridge.getSystemProperty("gsm.version.baseband") },
                 "ro.build.expect.baseband" nLayer { NativeBridge.getSystemProperty("ro.build.expect.baseband") },
             )
+            // SERIAL — Android 8+ Build.getSerial() 没 READ_PRIVILEGED_PHONE_STATE
+            // 权限会返回 "unknown",这是 Google 强制的真机行为,不该跟 ro.serialno
+            // 做一致性 check(真机本来就不一致)。只看 native 双源是否一致。
             field("SERIAL",
-                "Build.getSerial()" jLayer { reflectGetSerial() },
                 "ro.serialno" nLayer { NativeBridge.getSystemProperty("ro.serialno") },
                 "ro.boot.serialno" nLayer { NativeBridge.getSystemProperty("ro.boot.serialno") },
+            )
+            // Build.getSerial() 单独记录(只为信息,不参与一致性)
+            field("Build.getSerial() (info-only)",
+                "Build.getSerial()" jLayer { reflectGetSerial() },
             )
             field("SKU",
                 "Build.SKU" jLayer { Build.SKU },
@@ -152,6 +158,25 @@ class GhostCollector(private val context: Context) {
             field("SUPPORTED_ABIS",
                 "Build.SUPPORTED_ABIS" jLayer { Build.SUPPORTED_ABIS.joinToString(",") },
                 "ro.product.cpu.abilist" nLayer { NativeBridge.getSystemProperty("ro.product.cpu.abilist") },
+            )
+            // Build.USER — DG bytecode 校验 USER ⇔ BRAND;真机原值"android-build"跟任何品牌矛盾
+            field("USER",
+                "Build.USER" jLayer { Build.USER },
+                "ro.build.user" nLayer { NativeBridge.getSystemProperty("ro.build.user") },
+            )
+            // getRadioVersion() — Android 12+ 直接读 gsm.version.baseband 绕过 Build.RADIO 静态字段;
+            // ghost BuildHook 当前只 hook Build.RADIO 字段没 hook getRadioVersion(),Android 12+ 设备暴露
+            field("getRadioVersion()",
+                "Build.getRadioVersion()" jLayer { Build.getRadioVersion() ?: "" },
+                "gsm.version.baseband" nLayer { NativeBridge.getSystemProperty("gsm.version.baseband") },
+            )
+            // ro.arch — DG native 直读(0x12ec0 地址),目前 __system_property_read_callback hook 已注释
+            field("ro.arch",
+                "ro.arch" nLayer { NativeBridge.getSystemProperty("ro.arch") },
+            )
+            // ro.board.platform — SoC 平台,DG 可能查
+            field("ro.board.platform",
+                "ro.board.platform" nLayer { NativeBridge.getSystemProperty("ro.board.platform") },
             )
         }
 
@@ -341,6 +366,26 @@ class GhostCollector(private val context: Context) {
                     (javaGlGet(GLES10.GL_EXTENSIONS) ?: "").length.toString()
                 },
             )
+            // DG accessor:k = sha1(GL_EXTENSIONS),跨 session 唯一 ID。ghost 用同一份 extensions
+            // 则所有用户 hash 一致 → 跨用户唯一 ID → 需要 per-device salt
+            field("GL_EXTENSIONS.sha1",
+                "native EGL + sha1" nLayer { sha1Hex(gles.getOrNull(3) ?: "") },
+                "Java GLES10 + sha1" jLayer { sha1Hex(javaGlGet(GLES10.GL_EXTENSIONS) ?: "") },
+            )
+            // GL_SHADING_LANGUAGE_VERSION (0x8B8C) — DG 可能查
+            field("GL_SHADING_LANGUAGE_VERSION",
+                "Java GLES10.glGetString(0x8B8C)" jLayer { javaGlGet(0x8B8C) },
+            )
+            // EGL driver 文件 SHA-1 列表 — DG 标签 sla/sll/slq/slum 通过
+            // File.listFiles("/system/lib/egl") + sha1 each。物理设备真实硬件值,ghost 无法 spoof
+            field("egl_driver_files",
+                "ls /vendor/lib64/egl/" sLayer {
+                    listOf("/vendor/lib64/egl", "/vendor/lib/egl", "/system/lib64/egl", "/system/lib/egl")
+                        .flatMap { dir -> java.io.File(dir).listFiles()?.toList() ?: emptyList() }
+                        .filter { it.name.endsWith(".so") }
+                        .joinToString(",") { it.name }
+                },
+            )
             field("ro.hardware.egl",
                 "ro.hardware.egl" nLayer { NativeBridge.getSystemProperty("ro.hardware.egl") },
             )
@@ -408,6 +453,79 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // I-2. Sensors — DG 通过 lasr/rvsr/sei 标签采集传感器元信息
+        // ============================================================
+        category("sensors") {
+            val sm = context.getSystemService(Context.SENSOR_SERVICE) as? android.hardware.SensorManager
+            val sensors = sm?.getSensorList(android.hardware.Sensor.TYPE_ALL).orEmpty()
+            // 总数 — DG 可能统计;真机一般 10-20 个,ghost 当前 SensorManagerHook 伪造数量不全
+            field("sensor.count",
+                "SensorManager.getSensorList(TYPE_ALL).size" jLayer { sensors.size.toString() },
+            )
+            // 单个 sensor name 哈希 — DG 看 name 字符串。ghost 用 stringUpper(5) 生成
+            // "QFRJU" 类乱码,真实设备应该是 "LSM6DSO Accelerometer" 之类
+            field("sensor.names_sha1",
+                "SensorList.name 排序 sha1" jLayer {
+                    sha1Hex(sensors.map { it.name }.sorted().joinToString("\n"))
+                },
+            )
+            field("sensor.vendors_sha1",
+                "SensorList.vendor 排序 sha1" jLayer {
+                    sha1Hex(sensors.map { it.vendor }.sorted().joinToString("\n"))
+                },
+            )
+            // 单个加速度计 name(DG lasr 标签),验证是否 "QFRJU" 类乱码
+            field("sensor.linear_accel.name",
+                "Sensor(TYPE_LINEAR_ACCELERATION).name" jLayer {
+                    sm?.getDefaultSensor(android.hardware.Sensor.TYPE_LINEAR_ACCELERATION)?.name ?: ""
+                },
+            )
+            field("sensor.rotation_vector.name",
+                "Sensor(TYPE_ROTATION_VECTOR).name" jLayer {
+                    sm?.getDefaultSensor(android.hardware.Sensor.TYPE_ROTATION_VECTOR)?.name ?: ""
+                },
+            )
+            field("sensor.accelerometer.vendor",
+                "Sensor(TYPE_ACCELEROMETER).vendor" jLayer {
+                    sm?.getDefaultSensor(android.hardware.Sensor.TYPE_ACCELEROMETER)?.vendor ?: ""
+                },
+            )
+        }
+
+        // ============================================================
+        // I-3. 已加载 native 库 — DG 通过 dl_iterate_phdr 标签 lib 枚举
+        // ============================================================
+        category("loaded-libs") {
+            val maps = NativeBridge.readFile("/proc/self/maps", 524288)
+            // 提取所有 mmap 出来的 .so 文件名(去重)
+            val soFiles = maps.lineSequence()
+                .mapNotNull { line ->
+                    Regex("\\s(/[^\\s]+\\.so)$").find(line)?.groupValues?.get(1)
+                }
+                .toSet()
+                .sorted()
+            field("loaded_so.count",
+                "/proc/self/maps so count" pLayer { soFiles.size.toString() },
+            )
+            // 关键 LSPosed / Xposed / Magisk 痕迹库,任何一个出现说明 hide_utils 没盖全
+            for (suspiciousSo in listOf(
+                "liblspd.so", "libriru_lsposed.so", "libzygisk.so", "libxposed_art.so",
+                "libplay.so", "libdobby.so", "libsubstrate.so", "libsubstrate-dvm.so",
+                "libfrida-agent.so", "libfrida-gadget.so",
+            )) {
+                field("loaded_so.has_$suspiciousSo",
+                    "soFiles.contains" pLayer {
+                        soFiles.any { it.contains(suspiciousSo) }.toString()
+                    },
+                )
+            }
+            // 全列表 hash — 跨 session 稳定性指标,DG 可用作跨设备 ID
+            field("loaded_so.all_sha1",
+                "全部 .so 排序后 sha1" pLayer { sha1Hex(soFiles.joinToString("\n")) },
+            )
+        }
+
+        // ============================================================
         // J. Sensors / Time / Locale / 其他
         // ============================================================
         category("misc") {
@@ -422,6 +540,20 @@ class GhostCollector(private val context: Context) {
             field("ro.build.description",
                 "ro.build.description" nLayer { NativeBridge.getSystemProperty("ro.build.description") },
             )
+            // ro.build.date.utc vs Build.TIME — TIME spoof 一致性(文档 §2.1 说 TIME 跨 profile 不变是漏洞)
+            field("ro.build.date.utc",
+                "ro.build.date.utc * 1000" nLayer {
+                    NativeBridge.getSystemProperty("ro.build.date.utc").toLongOrNull()
+                        ?.let { (it * 1000).toString() } ?: ""
+                },
+                "Build.TIME" jLayer { Build.TIME.toString() },
+            )
+            // ro.bootloader vs Build.BOOTLOADER — Android 12+ getRadioVersion 同款问题
+            field("ro.bootloader",
+                "ro.bootloader" nLayer { NativeBridge.getSystemProperty("ro.bootloader") },
+                "ro.boot.bootloader" nLayer { NativeBridge.getSystemProperty("ro.boot.bootloader") },
+                "Build.BOOTLOADER" jLayer { Build.BOOTLOADER },
+            )
             field("ro.boot.boot_devices",
                 "ro.boot.boot_devices" nLayer { NativeBridge.getSystemProperty("ro.boot.boot_devices") },
             )
@@ -433,6 +565,34 @@ class GhostCollector(private val context: Context) {
             )
             field("ro.config.ringtone",
                 "ro.config.ringtone" nLayer { NativeBridge.getSystemProperty("ro.config.ringtone") },
+            )
+
+            // ============================================================
+            // Verified Boot / 反模拟器(ghost setSysProp 强制 spoof 的硬编码值)
+            //   真机典型值:verifiedbootstate=green, flash.locked=1, veritymode=enforcing,
+            //               warranty_bit=0, kernel.qemu=0
+            //   ghost spoof 后应固定这些值。如果泄露真值,Verified Boot 状态不对 = anchor。
+            // ============================================================
+            field("ro.boot.verifiedbootstate",
+                "ro.boot.verifiedbootstate" nLayer { NativeBridge.getSystemProperty("ro.boot.verifiedbootstate") },
+            )
+            field("ro.boot.flash.locked",
+                "ro.boot.flash.locked" nLayer { NativeBridge.getSystemProperty("ro.boot.flash.locked") },
+            )
+            field("ro.boot.veritymode",
+                "ro.boot.veritymode" nLayer { NativeBridge.getSystemProperty("ro.boot.veritymode") },
+            )
+            field("ro.boot.warranty_bit",
+                "ro.boot.warranty_bit" nLayer { NativeBridge.getSystemProperty("ro.boot.warranty_bit") },
+            )
+            field("ro.kernel.qemu",
+                "ro.kernel.qemu" nLayer { NativeBridge.getSystemProperty("ro.kernel.qemu") },
+            )
+            field("ro.boot.qemu",
+                "ro.boot.qemu" nLayer { NativeBridge.getSystemProperty("ro.boot.qemu") },
+            )
+            field("ro.boot.hardware.qemu",
+                "ro.boot.hardware.qemu" nLayer { NativeBridge.getSystemProperty("ro.boot.hardware.qemu") },
             )
         }
 
