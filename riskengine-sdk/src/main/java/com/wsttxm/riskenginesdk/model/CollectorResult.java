@@ -19,30 +19,31 @@ public class CollectorResult {
 
     public void addValue(String method, String value) {
         values.put(method, value);
-        updateConsistency();
+        if (canonicalValue == null && value != null && !value.isEmpty()) {
+            canonicalValue = value;
+        }
     }
 
-    private void updateConsistency() {
-        if (values.isEmpty()) return;
+    /**
+     * 跨源一致性比对 — 仅用于 method 全是"同一字段不同 source"的场景
+     * (eg build_props 里同时有 java/native/shell 三 source 比对 ro.build.fingerprint)。
+     *
+     * 历史 bug:之前 addValue 自动调 updateConsistency,把 values map 里所有值
+     * 当作"应一致的同字段多源",但实际多数 collector 塞的是异构字段
+     * (wifi_info 里 mac_address/ssid/bssid/ip 6 个不同 sub-field),必报
+     * inconsistent → multi_source_validation 100% 误报。
+     *
+     * 现改成"显式 opt-in":collector 若真的有跨源比对需求,addValue 完后
+     * 主动 markCrossSourceConsistency()。默认 consistent=true 不做 equality。
+     */
+    public void markCrossSourceConsistency() {
+        if (values.size() < 2) { consistent = true; return; }
         String first = null;
         consistent = true;
-        for (Map.Entry<String, String> entry : values.entrySet()) {
-            String v = entry.getValue();
+        for (String v : values.values()) {
             if (v == null || v.isEmpty()) continue;
-            if (first == null) {
-                first = v;
-                canonicalValue = v;
-            } else if (!first.equals(v)) {
-                consistent = false;
-            }
-        }
-        if (canonicalValue == null && !values.isEmpty()) {
-            for (String v : values.values()) {
-                if (v != null && !v.isEmpty()) {
-                    canonicalValue = v;
-                    break;
-                }
-            }
+            if (first == null) first = v;
+            else if (!first.equals(v)) { consistent = false; break; }
         }
     }
 

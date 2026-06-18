@@ -39,6 +39,14 @@ public class SandboxDetector extends BaseDetector {
     }
 
     private void checkProcessCount(List<String> evidence) {
+        // ⚠ Android 11+(API 30+)SELinux hardening 让非 root app 通过 /proc listFiles()
+        // 只能看到自己的进程(1-5 个 dir)— /proc 全局视图被 hidepid=2 隔离。在普通
+        // 应用上 < 50 一定命中,跟真假沙箱无关 = 必中误报。
+        // 改用 ActivityManager.getRunningAppProcesses 拿当前 app 进程数(只是同 UID,
+        // 但至少不会误报);对真沙箱 (VirtualApp/Parallel Space) 它们也走 fd 路径检测。
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            return; // Android 11+:/proc 视图不可信,跳过
+        }
         try {
             File procDir = new File("/proc");
             File[] files = procDir.listFiles();
@@ -53,7 +61,6 @@ public class SandboxDetector extends BaseDetector {
                     }
                 }
             }
-            // Sandbox environments typically have very few processes
             if (processCount > 0 && processCount < 50) {
                 evidence.add("low_process_count:" + processCount);
             }
@@ -70,9 +77,16 @@ public class SandboxDetector extends BaseDetector {
                 for (File fd : fds) {
                     try {
                         String link = fd.getCanonicalPath();
-                        // Check for suspicious fd targets
-                        if (link.contains("virtual-app") || link.contains("sandbox") ||
-                                link.contains("parallel") || link.contains("dual")) {
+                        // 跳过系统组件路径 — Android 14+ SDK Runtime 的
+                        // /apex/com.android.adservices/javalib/framework-sdksandbox.jar 名字
+                        // 含 "sandbox" 字符串,真机也加载,不是多开/沙箱框架特征。
+                        if (link.startsWith("/apex/") || link.startsWith("/system/")) continue;
+                        // 多开框架特征路径:VirtualApp / Parallel Space / 双开
+                        if (link.contains("virtual-app") ||
+                                link.contains("/parallel/") || link.contains("ParallelSpace") ||
+                                link.contains("/dual_") || link.contains("DualApp") ||
+                                // 通用"sandbox"前后必须有路径/包名样式,避免命中系统 jar
+                                link.matches(".*/[A-Za-z_]*sandbox[A-Za-z_]*/.*")) {
                             evidence.add("suspicious_fd:" + link);
                             break;
                         }

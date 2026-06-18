@@ -28,8 +28,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var btnCollect: Button
     private lateinit var btnList: Button
     private lateinit var btnClear: Button
+    private lateinit var btnViewMode: Button
     private lateinit var tvSummary: TextView
     private lateinit var tvLog: TextView
+
+    // 视图模式:0=全字段 / 1=只看不一致 / 2=只看 SDK 检测
+    private var viewMode: Int = 0
+    private var lastReport: CollectReport? = null
+    private var lastSdkReport: com.wsttxm.riskenginesdk.model.RiskReport? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,17 +74,33 @@ class MainActivity : AppCompatActivity() {
         btnCollect = Button(this).apply { text = "采集设备信息" }
         btnList = Button(this).apply { text = "列出已保存报告" }
         btnClear = Button(this).apply { text = "清空报告" }
+        btnViewMode = Button(this).apply { text = "视图: 全字段" }
         tvSummary = TextView(this).apply {
             text = "等待采集..."
             textSize = 14f
             setPadding(0, 24, 0, 24)
         }
-        tvLog = TextView(this).apply { textSize = 11f }
+        tvLog = TextView(this).apply {
+            textSize = 11f
+            // 等宽 + 文字可选(便于复制单个值)
+            typeface = android.graphics.Typeface.MONOSPACE
+            setTextIsSelectable(true)
+        }
         val scroll = ScrollView(this).apply { addView(tvLog) }
 
-        root.addView(btnCollect)
-        root.addView(btnList)
-        root.addView(btnClear)
+        // 操作 button 横向一行,节省垂直空间
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btnCollect, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 2f))
+            addView(btnViewMode, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        val btnRow2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btnList,  LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(btnClear, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        root.addView(btnRow)
+        root.addView(btnRow2)
         root.addView(tvSummary)
         root.addView(scroll)
         setContentView(root)
@@ -88,6 +110,16 @@ class MainActivity : AppCompatActivity() {
         btnCollect.setOnClickListener { runCollection() }
         btnList.setOnClickListener { listReports() }
         btnClear.setOnClickListener { clearReports() }
+        btnViewMode.setOnClickListener {
+            viewMode = (viewMode + 1) % 3
+            btnViewMode.text = when (viewMode) {
+                0 -> "视图: 全字段"
+                1 -> "视图: 只看不一致"
+                else -> "视图: 只看 SDK"
+            }
+            // 重新渲染当前 report
+            lastReport?.let { tvLog.text = formatSummary(it, lastSdkReport) }
+        }
     }
 
     private fun ensureStoragePermission() {
@@ -145,6 +177,8 @@ class MainActivity : AppCompatActivity() {
 
             runOnUiThread {
                 btnCollect.isEnabled = true
+                lastReport = ghostReport
+                lastSdkReport = sdkReport
                 tvSummary.text = buildString {
                     append("✅ 采集完成\n")
                     append("ghost: ${ghostCost}ms / SDK: ${sdkCost}ms\n")
@@ -215,36 +249,55 @@ class MainActivity : AppCompatActivity() {
         tvLog.text = ""
     }
 
+    /** 截断长字符串,>=maxLen 加省略号 */
+    private fun trunc(s: String?, maxLen: Int = 100): String =
+        s?.let { if (it.length > maxLen) it.take(maxLen) + "…" else it } ?: "<null>"
+
+    /** 单个 field 渲染:✅/❌ name = value;不一致时展开各 source */
+    private fun renderField(sb: StringBuilder, f: FieldResult, expandSources: Boolean) {
+        val mark = if (f.consistent) "✅" else "❌"
+        sb.append("  $mark ${f.name} = ${trunc(f.canonicalValue)}\n")
+        if (expandSources || !f.consistent) {
+            f.sources.forEach { s ->
+                val sLabel = if (s.source.isNotEmpty()) " (${trunc(s.source, 40)})" else ""
+                sb.append("      ${s.layer.padEnd(7)}$sLabel = ${trunc(s.value)}\n")
+            }
+        }
+    }
+
     private fun formatSummary(
         report: CollectReport,
         sdkReport: com.wsttxm.riskenginesdk.model.RiskReport?,
     ): String {
         val sb = StringBuilder()
 
-        // ==== 部分 1:ghost-verify 不一致字段 ====
-        sb.append("==== ghost 不一致字段(${report.inconsistentCount}/${report.fieldCount}) ====\n\n")
-        for (field in report.fields) {
-            if (!field.consistent) {
-                sb.append("❌ [${field.category}] ${field.name}\n")
-                field.sources.forEach { src ->
-                    val v = src.value?.let { vv -> if (vv.length > 80) vv.take(80) + "…" else vv } ?: "<null>"
-                    sb.append("    ${src.layer.padEnd(7)} ${src.source} = $v\n")
+        // ==== Part 1: ghost-verify 字段 ====
+        // viewMode 控制范围:0=全字段 / 1=只看不一致 / 2=只看 SDK(跳过 ghost)
+        if (viewMode != 2) {
+            val showAll = viewMode == 0
+            val ghostFields = if (showAll) report.fields else report.fields.filter { !it.consistent }
+            sb.append("==== Ghost-Verify ${if (showAll) "全字段" else "不一致字段"} ")
+            sb.append("(${ghostFields.size}/${report.fieldCount},❌${report.inconsistentCount}) ====\n\n")
+
+            if (ghostFields.isEmpty()) {
+                sb.append("(无项符合 — 全部字段一致 ✅)\n\n")
+            } else {
+                // 按 category 分组,保留 collector 内顺序
+                val grouped = LinkedHashMap<String, MutableList<FieldResult>>()
+                ghostFields.forEach { grouped.getOrPut(it.category) { mutableListOf() }.add(it) }
+                for ((cat, list) in grouped) {
+                    val incons = list.count { !it.consistent }
+                    sb.append("【${cat}】 ${list.size} 字段")
+                    if (incons > 0) sb.append(" / ❌$incons")
+                    sb.append("\n")
+                    list.forEach { renderField(sb, it, expandSources = !showAll) }
+                    sb.append("\n")
                 }
-                sb.append("\n")
             }
         }
-        if (report.inconsistentCount == 0) sb.append("(全部字段一致 ✅)\n")
 
-        // ==== 部分 2:关键字段速览 ====
-        sb.append("\n==== 关键字段 ====\n")
-        for (k in listOf("MANUFACTURER","BRAND","MODEL","DEVICE","SOC_MODEL","SOC_MANUFACTURER",
-            "FINGERPRINT","SECURITY_PATCH","GL_RENDERER","GL_VENDOR","RADIO","BOOTLOADER")) {
-            val f = report.fields.firstOrNull { it.name == k } ?: continue
-            sb.append("[${if (f.consistent) "✅" else "❌"}] ${f.name} = ${f.canonicalValue ?: "<null>"}\n")
-        }
-
-        // ==== 部分 3:RiskEngine SDK 检测结果 ====
-        sb.append("\n==== RiskEngine SDK 检测 ====\n")
+        // ==== Part 2: RiskEngine SDK 检测 ====
+        sb.append("==== RiskEngine SDK 检测 ====\n")
         if (sdkReport == null) {
             sb.append("(SDK 采集失败)\n")
         } else {
@@ -258,7 +311,7 @@ class MainActivity : AppCompatActivity() {
                     "SAFE" -> "✅"
                     else -> "❓"
                 }
-                val ev = det.evidence?.let { e -> if (e.length > 100) e.take(100) + "…" else e } ?: ""
+                val ev = trunc(det.evidence, 150)
                 sb.append("$icon [${det.detectorName}] ${det.status} - $ev\n")
             }
         }
