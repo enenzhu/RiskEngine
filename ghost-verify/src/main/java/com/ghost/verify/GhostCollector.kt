@@ -617,6 +617,128 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // L. 设备指纹 ID(Phase A) — 商业风控 SDK(同盾/数美/瑞数)用作 deviceId 原子 ID。
+        //    ghost 应该给每个 UID/session 分别 spoof,verify 跨调用对比看稳定性。
+        // ============================================================
+        category("device-ids") {
+            // GAID — Google Advertising ID,广告归因核心(reflection 调,避免编译期依赖)
+            field("GAID (Google Advertising ID)",
+                "AdvertisingIdClient.Info.getId()" jLayer { reflectGetGaid(context) },
+            )
+            // Widevine L3 device unique ID — DRM 层硬件 ID
+            field("Widevine.deviceUniqueId",
+                "MediaDrm(EDEF8BA9...).getPropertyByteArray" jLayer { widevineDeviceId() },
+            )
+            field("Widevine.systemId",
+                "MediaDrm.getPropertyString(systemId)" jLayer { widevineProperty("systemId") },
+            )
+            field("Widevine.securityLevel",
+                "MediaDrm.getPropertyString(securityLevel)" jLayer { widevineProperty("securityLevel") },
+            )
+            // GSF Android ID — com.google.android.gsf.gservices 的 android_id(跟 Settings.Secure.ANDROID_ID 不同)
+            field("GSF Android ID",
+                "gservices.android_id" jLayer { reflectGetGsfAndroidId(context) },
+            )
+            // OAID — 国内厂商联盟 ID(华为/小米/OPPO/VIVO 各家 SDK 不同,这里探测类是否存在)
+            field("OAID provider available",
+                "vendor classes present" jLayer { detectOaidProviders() },
+            )
+        }
+
+        // ============================================================
+        // M. 风控对抗 / Hook 框架检测(Phase B) — 商业 SDK 用来发现注入框架。
+        //    ghost-verify 反向跑能发现 ghost 自身没盖住的痕迹。
+        // ============================================================
+        category("hook-detection") {
+            field("magisk.detected",
+                "magisk paths + package" jLayer { detectMagisk() },
+            )
+            field("root.detected",
+                "su binary + Build.TAGS + selinux" jLayer { detectRoot() },
+            )
+            field("frida.detected",
+                "/proc/maps grep + tcp 27042" jLayer { detectFrida() },
+            )
+            field("xposed.detected",
+                "XposedBridge class lookup" jLayer { detectXposed() },
+            )
+            field("lsposed.detected",
+                "LSPHooker_/LSPosedBridge class scan" jLayer { detectLsposed() },
+            )
+            field("debugger.attached",
+                "Debug.isDebuggerConnected" jLayer {
+                    android.os.Debug.isDebuggerConnected().toString()
+                },
+                "/proc/self/status TracerPid" pLayer {
+                    readTracerPid()?.let { if (it == 0) "false" else "true (pid=$it)" }
+                },
+            )
+            field("emulator.detected",
+                "Build.FINGERPRINT + hardware + qemu prop" jLayer { detectEmulator() },
+            )
+            field("accessibility.enabled_services",
+                "Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES" jLayer {
+                    Settings.Secure.getString(context.contentResolver,
+                        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
+                },
+            )
+            field("selinux.mode",
+                "/sys/fs/selinux/enforce" nLayer {
+                    NativeBridge.readFile("/sys/fs/selinux/enforce", 8).trim()
+                        .let { if (it == "1") "enforcing" else if (it == "0") "permissive" else it }
+                },
+                "shell getenforce" sLayer {
+                    Runtime.getRuntime().exec("getenforce").inputStream
+                        .bufferedReader().use { it.readLine().orEmpty().trim() }
+                },
+            )
+        }
+
+        // ============================================================
+        // N. 运行时行为指纹(Phase D) — boot count / uptime / 安装时间 等
+        //    新设备 install 后立即一键新机 = boot_count 小 + uptime 短 + install 时间近期 = 机器人嫌疑
+        // ============================================================
+        category("runtime-behavior") {
+            field("boot_count",
+                "Settings.Global.BOOT_COUNT" jLayer {
+                    Settings.Global.getInt(context.contentResolver,
+                        Settings.Global.BOOT_COUNT, -1).toString()
+                },
+            )
+            field("uptime_minutes",
+                "SystemClock.elapsedRealtime/60000" jLayer {
+                    (android.os.SystemClock.elapsedRealtime() / 60_000).toString()
+                },
+            )
+            field("self.firstInstallTime",
+                "PackageManager.firstInstallTime" jLayer {
+                    context.packageManager.getPackageInfo(context.packageName, 0)
+                        .firstInstallTime.toString()
+                },
+            )
+            field("self.lastUpdateTime",
+                "PackageManager.lastUpdateTime" jLayer {
+                    context.packageManager.getPackageInfo(context.packageName, 0)
+                        .lastUpdateTime.toString()
+                },
+            )
+            field("system_time_vs_uptime_drift_ms",
+                "(currentTimeMillis - elapsedRealtime - bootTimeMs)" jLayer {
+                    val now = System.currentTimeMillis()
+                    val up = android.os.SystemClock.elapsedRealtime()
+                    val expected = now - up
+                    // 真机 expected 应该接近 boot 时刻,稳定;频繁改时间 → 这个数飘
+                    expected.toString()
+                },
+            )
+            field("installed_pkg_count",
+                "PackageManager.getInstalledPackages.size" jLayer {
+                    context.packageManager.getInstalledPackages(0).size.toString()
+                },
+            )
+        }
+
+        // ============================================================
         // 收尾 — 构建 report
         // ============================================================
         val timestamp = System.currentTimeMillis()
@@ -695,6 +817,190 @@ class GhostCollector(private val context: Context) {
         } catch (e: Throwable) {
             try { Build.SERIAL } catch (e2: Throwable) { "" }
         }
+    }
+
+    // ========================================================================
+    // Phase A — 设备指纹 ID helpers
+    // ========================================================================
+
+    /** GAID — 通过 reflection 调 GMS AdvertisingIdClient,避免编译期依赖 play-services-ads */
+    private fun reflectGetGaid(ctx: android.content.Context): String {
+        return try {
+            val cls = Class.forName("com.google.android.gms.ads.identifier.AdvertisingIdClient")
+            val info = cls.getMethod("getAdvertisingIdInfo", android.content.Context::class.java)
+                .invoke(null, ctx)
+            val id = info.javaClass.getMethod("getId").invoke(info) as? String
+            val lat = info.javaClass.getMethod("isLimitAdTrackingEnabled").invoke(info) as? Boolean
+            "$id (limited=$lat)"
+        } catch (t: Throwable) {
+            "<no-gms> ${t.javaClass.simpleName}"
+        }
+    }
+
+    private val WIDEVINE_UUID = java.util.UUID.fromString("EDEF8BA9-79D6-4ACE-A3C8-27DCD51D21ED")
+
+    /** Widevine deviceUniqueId — DRM 层硬件 ID,base64 后输出 */
+    @SuppressLint("HardwareIds")
+    private fun widevineDeviceId(): String {
+        return try {
+            val drm = android.media.MediaDrm(WIDEVINE_UUID)
+            val bytes = drm.getPropertyByteArray("deviceUniqueId")
+            drm.close()
+            android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+        } catch (t: Throwable) {
+            "<error> ${t.javaClass.simpleName}"
+        }
+    }
+
+    private fun widevineProperty(key: String): String {
+        return try {
+            val drm = android.media.MediaDrm(WIDEVINE_UUID)
+            val v = drm.getPropertyString(key)
+            drm.close()
+            v ?: ""
+        } catch (t: Throwable) {
+            "<error> ${t.javaClass.simpleName}"
+        }
+    }
+
+    /** GSF Android ID — 跟 Settings.Secure.ANDROID_ID 不同(后者 per-app per-user) */
+    @SuppressLint("HardwareIds")
+    private fun reflectGetGsfAndroidId(ctx: android.content.Context): String {
+        return try {
+            val uri = android.net.Uri.parse("content://com.google.android.gsf.gservices")
+            val cur = ctx.contentResolver.query(uri, null, null, arrayOf("android_id"), null)
+            cur?.use {
+                if (it.moveToFirst() && it.columnCount >= 2) {
+                    return@use java.lang.Long.toHexString(it.getLong(1))
+                }
+                ""
+            } ?: ""
+        } catch (t: Throwable) {
+            "<no-gsf>"
+        }
+    }
+
+    /** OAID — 检测哪些 OEM 提供 OAID SDK 类(不调 API,只 probe) */
+    private fun detectOaidProviders(): String {
+        val classes = mapOf(
+            "Huawei" to "com.huawei.hms.ads.identifier.AdvertisingIdClient",
+            "Xiaomi" to "com.miui.deviceid.IdentifierManager",
+            "Oppo"   to "com.heytap.openid.IOpenID",
+            "Vivo"   to "com.vivo.identifier.IdentifierManager",
+            "MSA"    to "com.bun.miitmdid.core.MdidSdkHelper",
+        )
+        return classes.filter { runCatching { Class.forName(it.value) }.isSuccess }
+            .keys.joinToString(",").ifEmpty { "<none>" }
+    }
+
+    // ========================================================================
+    // Phase B — 风控对抗 / Hook 框架检测
+    // ========================================================================
+
+    private fun detectMagisk(): String {
+        val hits = mutableListOf<String>()
+        listOf(
+            "/sbin/.magisk", "/data/adb/magisk", "/data/adb/modules",
+            "/system/etc/init/magisk.rc", "/data/adb/magisk.db",
+        ).forEach { p -> if (java.io.File(p).exists()) hits += "file:$p" }
+        listOf("com.topjohnwu.magisk", "io.github.huskydg.magisk").forEach { pkg ->
+            runCatching {
+                context.packageManager.getPackageInfo(pkg, 0); hits += "pkg:$pkg"
+            }
+        }
+        return if (hits.isEmpty()) "false" else hits.joinToString(";")
+    }
+
+    private fun detectRoot(): String {
+        val hits = mutableListOf<String>()
+        listOf("/system/xbin/su", "/system/bin/su", "/sbin/su",
+               "/su/bin/su", "/magisk/.core/bin/su").forEach { p ->
+            if (java.io.File(p).exists()) hits += "su:$p"
+        }
+        if (Build.TAGS?.contains("test-keys") == true) hits += "tags:test-keys"
+        if (NativeBridge.getSystemProperty("ro.debuggable") == "1") hits += "ro.debuggable=1"
+        if (NativeBridge.getSystemProperty("ro.secure") == "0") hits += "ro.secure=0"
+        return if (hits.isEmpty()) "false" else hits.joinToString(";")
+    }
+
+    private fun detectFrida(): String {
+        val hits = mutableListOf<String>()
+        runCatching {
+            val maps = NativeBridge.readFile("/proc/self/maps", 65536)
+            listOf("frida-agent", "frida-gadget", "frida-server", "gum-js-loop", "gmain")
+                .forEach { needle -> if (maps.contains(needle)) hits += "maps:$needle" }
+        }
+        // try TCP 27042(frida-server 默认 port)
+        runCatching {
+            java.net.Socket().use { s ->
+                s.connect(java.net.InetSocketAddress("127.0.0.1", 27042), 200)
+                if (s.isConnected) hits += "tcp:27042"
+            }
+        }
+        return if (hits.isEmpty()) "false" else hits.joinToString(";")
+    }
+
+    private fun detectXposed(): String {
+        val hits = mutableListOf<String>()
+        listOf("de.robv.android.xposed.XposedBridge",
+               "de.robv.android.xposed.XC_MethodHook",
+               "de.robv.android.xposed.XposedHelpers"
+        ).forEach { c -> if (runCatching { Class.forName(c) }.isSuccess) hits += c }
+        return if (hits.isEmpty()) "false" else hits.joinToString(";")
+    }
+
+    /** LSPosed 痕迹 — 扫 ClassLoader 父链找 LSPHooker_ 前缀类(memory project_dg_signal_audit) */
+    private fun detectLsposed(): String {
+        val hits = mutableListOf<String>()
+        listOf("org.lsposed.lspd.core.ApplicationServiceClient",
+               "org.lsposed.lspd.nativebridge.NativeAPI",
+               "io.github.lsposed.manager",
+        ).forEach { c -> if (runCatching { Class.forName(c) }.isSuccess) hits += "cls:$c" }
+        // LSPHooker_ 类前缀 — 扫 ClassLoader 内已加载类(需要 PathClassLoader pathList 反射)
+        runCatching {
+            val cl = javaClass.classLoader ?: return@runCatching
+            val pathListField = Class.forName("dalvik.system.BaseDexClassLoader")
+                .getDeclaredField("pathList").apply { isAccessible = true }
+            val pathList = pathListField.get(cl) ?: return@runCatching
+            val elementsField = pathList.javaClass.getDeclaredField("dexElements")
+                .apply { isAccessible = true }
+            val elements = elementsField.get(pathList) as? Array<*> ?: return@runCatching
+            // 找 LSPHooker_ 类(若存在则在某个 dex 里)
+            for (e in elements) {
+                val dexFileField = e?.javaClass?.getDeclaredField("dexFile")
+                    ?.apply { isAccessible = true } ?: continue
+                val dex = dexFileField.get(e) ?: continue
+                val entriesMethod = dex.javaClass.getMethod("entries")
+                @Suppress("UNCHECKED_CAST")
+                val entries = entriesMethod.invoke(dex) as? java.util.Enumeration<String> ?: continue
+                while (entries.hasMoreElements()) {
+                    val n = entries.nextElement()
+                    if (n.contains("LSPHooker_")) { hits += "dex-cls:$n"; return@runCatching }
+                }
+            }
+        }
+        return if (hits.isEmpty()) "false" else hits.joinToString(";")
+    }
+
+    private fun readTracerPid(): Int? = runCatching {
+        val status = NativeBridge.readFile("/proc/self/status", 8192)
+        status.lineSequence().firstOrNull { it.startsWith("TracerPid:") }
+            ?.substringAfter(":")?.trim()?.toIntOrNull()
+    }.getOrNull()
+
+    private fun detectEmulator(): String {
+        val hits = mutableListOf<String>()
+        val fp = Build.FINGERPRINT.orEmpty()
+        if (fp.startsWith("generic") || fp.startsWith("unknown")) hits += "fp:$fp"
+        if (Build.MODEL.contains("google_sdk", ignoreCase = true)
+            || Build.MODEL.contains("Emulator", ignoreCase = true)
+            || Build.MODEL.contains("Android SDK built for", ignoreCase = true))
+            hits += "model:${Build.MODEL}"
+        val hw = Build.HARDWARE.orEmpty()
+        if (hw == "goldfish" || hw == "ranchu" || hw.contains("vbox")) hits += "hw:$hw"
+        if (NativeBridge.getSystemProperty("ro.kernel.qemu") == "1") hits += "ro.kernel.qemu=1"
+        if (NativeBridge.getSystemProperty("ro.boot.qemu") == "1") hits += "ro.boot.qemu=1"
+        return if (hits.isEmpty()) "false" else hits.joinToString(";")
     }
 
     /** Java GLES10.glGetString — 没 GL context 时返回 null,但仍然记录便于交叉验证。 */
