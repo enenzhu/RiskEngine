@@ -312,8 +312,13 @@ class MainActivity : AppCompatActivity() {
             // === 黑产 app ===
             "app.has_loan","app.has_sms_bomber","app.has_location_spoof",
             "app.has_phone_changer","app.has_gambling","app.has_automation",
-            "app.has_root_manager" ->
+            "app.has_root_manager","app.has_hook_framework","app.has_vpn_proxy",
+            "app.has_sniff_capture" ->
                 if (v.startsWith("true")) "🚨 装了 ${f.name.removePrefix("app.has_")} 类 app" else null
+            "app.sensitive_visible" -> {
+                val n = Regex("^\\d+").find(v)?.value?.toIntOrNull() ?: 0
+                if (n > 0) "🚨 整机敏感 app 暴露 $n 个" else null
+            }
             else -> null
         }
     }

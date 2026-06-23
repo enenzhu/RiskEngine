@@ -1185,42 +1185,105 @@ class GhostCollector(private val context: Context) {
                 context.packageManager.getInstalledPackages(0).map { it.packageName }.toSet()
             }.getOrElse { emptySet() }
 
+            // 每个 risk 类两个匹配维度:exact(精确包名)+ keywordHints(任一子串命中即算)。
+            // 精确匹配漏率高 — 同类工具多种发行版/分支(SukiSU、KernelSU、MMRL 各自一个 pkg);
+            // keyword fallback 兜底,出现新变种也能识别。命中后字段值列出实际包名供排查。
+            data class RiskRule(val exact: Set<String>, val keywordHints: Set<String>)
             val riskCategories = mapOf(
-                "loan" to listOf(  // 信贷/借款类(部分常见)
-                    "com.tencent.lemon", "com.youxiabank.pro", "com.jdcn.fido.appdownloader",
-                    "com.alibaba.amap", "com.haier.cellularData",
+                "loan" to RiskRule(
+                    exact = setOf(
+                        "com.tencent.lemon", "com.youxiabank.pro", "com.jdcn.fido.appdownloader",
+                        "com.alibaba.amap", "com.haier.cellularData",
+                    ),
+                    keywordHints = setOf("loan", "jiekuan", "daikuan", "huabei"),
                 ),
-                "sms_bomber" to listOf(  // 短信轰炸(国内常见名)
-                    "com.cjwsc.smsbomber", "io.github.snhua.smsbom", "com.sms.bomber",
+                "sms_bomber" to RiskRule(
+                    exact = setOf("com.cjwsc.smsbomber", "io.github.snhua.smsbom", "com.sms.bomber"),
+                    keywordHints = setOf("smsbom", "smsbomber"),
                 ),
-                "location_spoof" to listOf(
-                    "com.lerist.fakelocation", "com.evozi.injector", "com.theappninjas.fakegpsjoystick",
-                    "com.lexa.fakegps", "com.fakegps.mock", "com.incorporateapps.fakegps_route",
+                "location_spoof" to RiskRule(
+                    exact = setOf(
+                        "com.lerist.fakelocation", "com.evozi.injector", "com.theappninjas.fakegpsjoystick",
+                        "com.lexa.fakegps", "com.fakegps.mock", "com.incorporateapps.fakegps_route",
+                    ),
+                    keywordHints = setOf("fakegps", "fakelocation", "mocklocation"),
                 ),
-                "phone_changer" to listOf(  // 改号软件
-                    "com.unison.phone.changer", "com.fakecall.app",
+                "phone_changer" to RiskRule(
+                    exact = setOf("com.unison.phone.changer", "com.fakecall.app"),
+                    keywordHints = setOf("phonechanger", "fakecall"),
                 ),
-                "gambling" to listOf(  // 赌博类(国内黑产常见)
-                    "com.thirteen.poker", "com.qcplay.dz",
+                "gambling" to RiskRule(
+                    exact = setOf("com.thirteen.poker", "com.qcplay.dz"),
+                    keywordHints = setOf("poker", "casino", "doudizhu"),
                 ),
-                "automation" to listOf(  // 自动化工具
-                    "com.zzz.acc", "io.appium.settings", "io.appium.uiautomator2.server",
-                    "com.willowtreeapps.fuzz", "ru.yanus171.android.LaunchAutomate",
-                    "com.qihoo.autoclick", "auto.js.com.stardust",
+                "automation" to RiskRule(
+                    // org.auto.auto.v6 = AutoX.js 国内分支;auto.js.com.stardust = AutoJS 主线
+                    exact = setOf(
+                        "com.zzz.acc", "io.appium.settings", "io.appium.uiautomator2.server",
+                        "com.willowtreeapps.fuzz", "ru.yanus171.android.LaunchAutomate",
+                        "com.qihoo.autoclick", "auto.js.com.stardust", "org.auto.auto.v6",
+                    ),
+                    keywordHints = setOf("autojs", "auto.js", "autoclick", "uiautomator", "appium"),
                 ),
-                "root_manager" to listOf(  // root 管理 app
-                    "com.topjohnwu.magisk", "me.weishu.kernelsu", "io.github.huskydg.magisk",
+                "root_manager" to RiskRule(
+                    // 加 SukiSU(KernelSU 衍生)、MMRL、APatch 等社区分支
+                    exact = setOf(
+                        "com.topjohnwu.magisk", "me.weishu.kernelsu", "io.github.huskydg.magisk",
+                        "com.sukisu.ultra", "com.dergoogler.mmrl", "me.bmax.apatch",
+                    ),
+                    keywordHints = setOf("magisk", "kernelsu", "sukisu", "apatch"),
+                ),
+                "hook_framework" to RiskRule(
+                    // Xposed / LSPosed / Frida 管理器或 client app
+                    exact = setOf(
+                        "de.robv.android.xposed.installer", "org.lsposed.manager",
+                        "org.lsposed.lspatch", "io.va.exposed", "me.iacn.biliroaming",
+                    ),
+                    keywordHints = setOf("xposed", "lsposed", "lspatch", "frida"),
+                ),
+                "vpn_proxy" to RiskRule(
+                    // 代理/翻墙工具(影响 IP / DNS / 网络指纹)
+                    exact = setOf(
+                        "moe.nb4a", "com.github.shadowsocks", "com.v2ray.ang",
+                        "fun.kitsunebi.kitsunebi4android", "com.github.metacubex.clash.meta",
+                        "com.github.kr328.clash", "io.nekohasekai.sfa", "app.nekoray.android",
+                    ),
+                    keywordHints = setOf(
+                        "v2ray", "shadowsocks", "clash", "nekobox", "nekoray", "kitsunebi",
+                        "trojan", "wireguard", "xray", "outline",
+                    ),
+                ),
+                "sniff_capture" to RiskRule(
+                    // 抓包/调试代理工具
+                    exact = setOf(
+                        "com.reqable.android", "app.charles.proxy", "com.guoshi.httpcanary",
+                        "com.minhui.networkcapture", "com.evbadroid.proxymon",
+                    ),
+                    keywordHints = setOf("reqable", "httpcanary", "charles", "fiddler", "mitmproxy"),
                 ),
             )
 
-            for ((cat, pkgs) in riskCategories) {
-                val hits = pkgs.filter { it in installedPkgs }
+            for ((cat, rule) in riskCategories) {
+                val hits = installedPkgs.filter { pkg ->
+                    pkg in rule.exact || rule.keywordHints.any { kw -> kw in pkg.lowercase() }
+                }
                 field("app.has_$cat",
-                    "PackageManager.getInstalledPackages contains" jLayer {
+                    "exact + keyword over getInstalledPackages" jLayer {
                         if (hits.isEmpty()) "false" else "true (${hits.joinToString(",")})"
                     },
                 )
             }
+            // 汇总所有命中(独立类汇总,方便一眼看出整机敏感 app 数量)
+            field("app.sensitive_visible",
+                "exact+keyword union" jLayer {
+                    val allHits = installedPkgs.filter { pkg ->
+                        riskCategories.values.any { r ->
+                            pkg in r.exact || r.keywordHints.any { kw -> kw in pkg.lowercase() }
+                        }
+                    }
+                    if (allHits.isEmpty()) "0" else "${allHits.size} (${allHits.joinToString(",")})"
+                },
+            )
             field("app.installed_count",
                 "getInstalledPackages.size" jLayer { installedPkgs.size.toString() },
             )
