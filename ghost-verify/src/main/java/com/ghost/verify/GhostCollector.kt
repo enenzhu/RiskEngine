@@ -523,6 +523,48 @@ class GhostCollector(private val context: Context) {
             field("loaded_so.all_sha1",
                 "全部 .so 排序后 sha1" pLayer { sha1Hex(soFiles.joinToString("\n")) },
             )
+
+            // ===== native 路径:dl_iterate_phdr 枚举(商业风控主用,绕 /proc/maps)=====
+            val dlList = runCatching { NativeBridge.enumerateLoadedSos().toList() }
+                .getOrDefault(emptyList())
+            val dlNonEmpty = dlList.filter { it.isNotBlank() }.toSet().sorted()
+            field("loaded_so.dl_iterate_phdr.count",
+                "dl_iterate_phdr (native)" nLayer { dlNonEmpty.size.toString() },
+            )
+            field("loaded_so.dl_iterate_phdr.sha1",
+                "dl_iterate_phdr 排序后 sha1" nLayer { sha1Hex(dlNonEmpty.joinToString("\n")) },
+            )
+
+            // ===== 跨源对比:dl_iterate_phdr vs /proc/self/maps =====
+            // ghost 通过 KernelSU.redirectIO + dlopen 注入虚拟 vendor SO 时,两条
+            // 路径应都看到 vendor SO 名 → SHA 也应跨"新机"协同变化。
+            // 但 dlpi_name 风格跟 maps 行格式不同(maps 含 device:inode 等),
+            // 直接 SHA 不会等同 — 这里只对 set 做 symmetric diff 看哪些 path 单源出现。
+            field("loaded_so.cross_source_diff",
+                "dl_only / maps_only path 个数" jLayer {
+                    val mapsSet = soFiles.toSet()
+                    val dlSet = dlNonEmpty.toSet()
+                    val dlOnly = (dlSet - mapsSet).size
+                    val mapsOnly = (mapsSet - dlSet).size
+                    "dl_only=$dlOnly,maps_only=$mapsOnly,both=${(dlSet intersect mapsSet).size}"
+                },
+            )
+
+            // ===== ghost #44 vendor SO 注入命中检测 =====
+            // 验证 ghost 是否真的让 dl_iterate_phdr 吐出 vendor SO 名。
+            for (vendorSo in listOf(
+                "libGLES_mali.so", "libGLESv2_adreno.so", "libEGL_adreno.so",
+                "libgsl.so", "libsec-ril.so", "libtitanm.so", "libmali.so",
+            )) {
+                field("loaded_so.dl_has_$vendorSo",
+                    "dl_iterate_phdr any.contains" nLayer {
+                        dlNonEmpty.any { it.contains(vendorSo) }.toString()
+                    },
+                    "maps any.contains" pLayer {
+                        soFiles.any { it.contains(vendorSo) }.toString()
+                    },
+                )
+            }
         }
 
         // ============================================================
@@ -753,6 +795,51 @@ class GhostCollector(private val context: Context) {
                         .bufferedReader().use { it.readLine().orEmpty().trim() }
                 },
             )
+
+            // anti-evasion 1:主动抛异常,看 stack trace 是否被 Xposed/hook 框架污染
+            // (PoisonGZ 评论:防小白用,正常运行下 stack 不应含 xposed 关键字)
+            field("anti_evasion.stacktrace_xposed",
+                "throw + catch + grep stack for xposed" jLayer {
+                    val hits = mutableListOf<String>()
+                    runCatching { throw RuntimeException("anti_evasion_probe") }
+                        .onFailure { t ->
+                            val keywords = listOf("xposed", "LSPosed", "LSPHooker_",
+                                "robv.android", "EdXposed", "Xposed", "frida")
+                            for (kw in keywords) {
+                                if (t.stackTraceToString().contains(kw, ignoreCase = true)) {
+                                    hits += kw
+                                }
+                            }
+                        }
+                    if (hits.isEmpty()) "clean" else "hit:${hits.joinToString(",")}"
+                },
+            )
+
+            // anti-evasion 2:发起一个 ApplicationPackageManager.getPackageInfo 调用,
+            // stack trace 应该包含 ApplicationPackageManager 类名;若 ghost LSPosed
+            // hook 该方法,trace 里会含 LSPHooker_ApplicationPackageManager 等代理类。
+            // (恋空原文 19 楼:"现在风控直接读 maps 提地址,扫内存特征";这是上一代
+            //  类名扫描检测,作为低成本兜底)
+            field("anti_evasion.pm_call_stack",
+                "ApplicationPackageManager.getPackageInfo stack contains LSPHooker_?" jLayer {
+                    val hits = mutableListOf<String>()
+                    runCatching {
+                        val cls = Class.forName("android.app.ApplicationPackageManager")
+                        // 反射拿当前 stack,看 hook 框架是否插入代理类
+                        val st = Thread.currentThread().stackTrace
+                        for (e in st) {
+                            val cn = e.className
+                            if (cn.contains("LSPHooker_") || cn.contains("Xposed") ||
+                                cn.contains("LSPosed") || cn.contains("robv.android")) {
+                                hits += "${e.className}.${e.methodName}"
+                            }
+                        }
+                        // 也 probe 一下 PackageManager 调用确实路过 ApplicationPackageManager
+                        context.packageManager.getPackageInfo(context.packageName, 0)
+                    }
+                    if (hits.isEmpty()) "clean" else "hit:${hits.joinToString(";").take(150)}"
+                },
+            )
         }
 
         // ============================================================
@@ -795,6 +882,97 @@ class GhostCollector(private val context: Context) {
             field("installed_pkg_count",
                 "PackageManager.getInstalledPackages.size" jLayer {
                     context.packageManager.getInstalledPackages(0).size.toString()
+                },
+            )
+        }
+
+        // ============================================================
+        // O. 风控奇葩检测点(Phase G,基于看雪恋空系列文章)
+        //    某宝/某付宝/某多/某东等大厂 SDK 实际用到的"非显而易见"信号。
+        //    商业 SDK 用这些点判断:模拟器 / 机器人 / 异常环境。
+        // ============================================================
+        category("risk-quirks") {
+            // 锁屏密码(某宝/某付宝 SDK)— 真用户机 >95% 设密码,模拟器/小号常 false
+            // 拆成 2 source:isDeviceSecure 走 ITrustManager binder,isKeyguardSecure 走 IWindowManager.
+            // 任一返回 false 就被风控判定异常 → ghost 需要两个 binder service 都 server-hook.
+            field("keyguard.is_secure",
+                "KM.isDeviceSecure (→ ITrustManager)" jLayer {
+                    val km = context.getSystemService(android.content.Context.KEYGUARD_SERVICE)
+                        as? android.app.KeyguardManager
+                    km?.isDeviceSecure.toString()
+                },
+                "KM.isKeyguardSecure (→ IWindowManager)" jLayer {
+                    val km = context.getSystemService(android.content.Context.KEYGUARD_SERVICE)
+                        as? android.app.KeyguardManager
+                    km?.isKeyguardSecure.toString()
+                },
+            )
+
+            // /system/build.prop 修改时间检测(某多/某东 SDK)
+            // 真机编译产出的 build.prop mtime 通常是 1970-01 或 2009-01,秒 % 1000 == 0
+            // 模拟器 / 魔改 ROM 改 prop 重启后 mtime 是任意时刻,秒 % 1000 != 0
+            field("build_prop.mtime_secure",
+                "File('/system/build.prop').lastModified()/1000 %1000 == 0" jLayer {
+                    val mtimeMs = java.io.File("/system/build.prop").lastModified()
+                    if (mtimeMs == 0L) "<unreadable>"
+                    else {
+                        val secModK = (mtimeMs / 1000) % 1000
+                        "secure=${secModK == 0L} (mtime=${mtimeMs}, sec%1000=$secModK)"
+                    }
+                },
+            )
+
+            // 应用商店包名(某多 SDK)— 真机 OEM 应安装对应 OEM 自己的应用市场
+            // ghost spoof Build.MANUFACTURER 但没装对应市场 = anchor(eg 装的是 Huawei
+            // AppMarket 但 spoof 成 OPPO,跟当前 Build.MANUFACTURER 不一致)
+            field("app_market.packages",
+                "PackageManager category.APP_MARKET" jLayer {
+                    runCatching {
+                        val intent = android.content.Intent(android.content.Intent.ACTION_MAIN)
+                            .addCategory("android.intent.category.APP_MARKET")
+                        context.packageManager.queryIntentActivities(intent, 0)
+                            .joinToString(",") { it.activityInfo.packageName }
+                    }.getOrElse { "<err> ${it.message}" }
+                },
+            )
+
+            // 默认输入法(高区分度字段 — 真用户安装第三方输入法多样化)
+            field("default_input_method",
+                "Settings.Secure.default_input_method" jLayer {
+                    android.provider.Settings.Secure.getString(
+                        context.contentResolver, "default_input_method") ?: ""
+                },
+            )
+
+            // 主流 app 安装时间(wx/qq/zfb)— 风控用作"账户老化"判断,
+            // 真用户的 wx/zfb 装机时间通常远早于当前时刻;新设备/小号通常 install 很近
+            field("major_apps.installtime",
+                "wx/qq/zfb/dy firstInstallTime" jLayer {
+                    val pkgs = listOf(
+                        "com.tencent.mm" to "wechat",
+                        "com.tencent.mobileqq" to "qq",
+                        "com.eg.android.AlipayGphone" to "alipay",
+                        "com.ss.android.ugc.aweme" to "douyin",
+                        "com.taobao.taobao" to "taobao",
+                    )
+                    pkgs.mapNotNull { (pkg, label) ->
+                        runCatching {
+                            val ts = context.packageManager.getPackageInfo(pkg, 0).firstInstallTime
+                            "$label=$ts"
+                        }.getOrNull()
+                    }.joinToString(",").ifEmpty { "<none-installed>" }
+                },
+            )
+
+            // 锁屏壁纸是否设置(辅助信号 — 新设备/模拟器很少改)
+            field("wallpaper.has_custom",
+                "WallpaperManager.getWallpaperInfo != null OR built-in" jLayer {
+                    runCatching {
+                        val wm = android.app.WallpaperManager.getInstance(context)
+                        // builtIn = false 说明用户设了自定义壁纸
+                        (wm.wallpaperInfo != null ||
+                            wm.getBuiltInDrawable(0, 0, false, 0f, 0f) != null).toString()
+                    }.getOrElse { "<denied>" }
                 },
             )
         }

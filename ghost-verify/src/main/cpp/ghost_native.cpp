@@ -173,3 +173,39 @@ Java_com_ghost_verify_NativeBridge_statFile(JNIEnv* env, jclass, jstring jpath) 
              (long long) st.st_size, (long long) st.st_mtime, st.st_mode & 0777);
     return env->NewStringUTF(buf);
 }
+
+// ============================================================
+// enumerateLoadedSos: dl_iterate_phdr() native 枚举 — 商业风控 SDK
+// (同盾 / 数美)主用路径,绕过 Java /proc/self/maps 解析。返回 dlpi_name
+// 列表(已加载 SO 的 realpath),verify 端比对 Java pLayer 读 /proc/self/maps
+// 的列表 → 任何差异 = ghost soinfo 注入 / hide 没盖全。
+// ============================================================
+#include <link.h>
+
+struct SoCollect {
+    JNIEnv* env;
+    std::vector<std::string>* names;
+};
+
+static int phdr_cb_collect(struct dl_phdr_info* info, size_t, void* data) {
+    auto* ctx = (SoCollect*) data;
+    if (info->dlpi_name && info->dlpi_name[0]) {
+        ctx->names->emplace_back(info->dlpi_name);
+    }
+    return 0;
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_com_ghost_verify_NativeBridge_enumerateLoadedSos(JNIEnv* env, jclass) {
+    std::vector<std::string> names;
+    SoCollect ctx{env, &names};
+    dl_iterate_phdr(phdr_cb_collect, &ctx);
+    jclass strCls = env->FindClass("java/lang/String");
+    jobjectArray arr = env->NewObjectArray((jsize) names.size(), strCls, nullptr);
+    for (size_t i = 0; i < names.size(); ++i) {
+        jstring js = env->NewStringUTF(names[i].c_str());
+        env->SetObjectArrayElement(arr, (jsize) i, js);
+        env->DeleteLocalRef(js);
+    }
+    return arr;
+}
