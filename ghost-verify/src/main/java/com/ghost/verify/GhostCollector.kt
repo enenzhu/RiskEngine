@@ -975,6 +975,255 @@ class GhostCollector(private val context: Context) {
                     }.getOrElse { "<denied>" }
                 },
             )
+
+            // ===== Phase H: 看雪恋空 thread-265169 图 1 设备指纹大表 =====
+            // 商业风控 SDK 实际采集字段,模拟器/小号常默认值,真用户机有随机性
+
+            // 电量(模拟器恒 100% / 永远充电)
+            field("battery.level",
+                "BatteryManager.BATTERY_PROPERTY_CAPACITY" jLayer {
+                    val bm = context.getSystemService(android.content.Context.BATTERY_SERVICE)
+                        as? android.os.BatteryManager
+                    bm?.getIntProperty(android.os.BatteryManager.BATTERY_PROPERTY_CAPACITY).toString()
+                },
+            )
+            field("battery.is_charging",
+                "BatteryManager.isCharging()" jLayer {
+                    val bm = context.getSystemService(android.content.Context.BATTERY_SERVICE)
+                        as? android.os.BatteryManager
+                    bm?.isCharging.toString()
+                },
+            )
+
+            // 耳机(真用户常插)
+            field("accessory.headphones_plugged",
+                "AudioManager.isWiredHeadsetOn" jLayer {
+                    @Suppress("DEPRECATION")
+                    val am = context.getSystemService(android.content.Context.AUDIO_SERVICE)
+                        as? android.media.AudioManager
+                    am?.isWiredHeadsetOn.toString()
+                },
+            )
+
+            // 剪贴板内容(模拟器/小号常空,真用户常有复制内容)
+            // Android 10+ 后台读受限,即使能读也只能在 Activity resumed 时
+            field("clipboard.has_content",
+                "ClipboardManager.hasPrimaryClip" jLayer {
+                    runCatching {
+                        val cm = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as? android.content.ClipboardManager
+                        cm?.hasPrimaryClip().toString()
+                    }.getOrElse { "<denied>" }
+                },
+            )
+
+            // 屏幕亮度(模拟器常默认 1.0 或 0)
+            field("screen.brightness",
+                "Settings.System.SCREEN_BRIGHTNESS" jLayer {
+                    android.provider.Settings.System.getInt(
+                        context.contentResolver,
+                        android.provider.Settings.System.SCREEN_BRIGHTNESS, -1).toString()
+                },
+            )
+        }
+
+        // ============================================================
+        // P. 传感器存在性(Phase H,图 4 篡改行为变量)
+        //    商业 SDK 探测真机硬件传感器存在性。某些模拟器没硬件传感器 → null
+        //    ghost spoof 后即使生成 sensor name list,商业 SDK 调
+        //    SensorManager.getDefaultSensor(TYPE) 仍是真机硬件 — 跨源不一致 = anchor
+        // ============================================================
+        category("sensors-presence") {
+            val sm = context.getSystemService(android.content.Context.SENSOR_SERVICE)
+                as? android.hardware.SensorManager
+            val sensors = listOf(
+                "accelerometer" to android.hardware.Sensor.TYPE_ACCELEROMETER,
+                "gyroscope"     to android.hardware.Sensor.TYPE_GYROSCOPE,
+                "gravity"       to android.hardware.Sensor.TYPE_GRAVITY,
+                "magnetic"      to android.hardware.Sensor.TYPE_MAGNETIC_FIELD,
+                "proximity"     to android.hardware.Sensor.TYPE_PROXIMITY,
+                "light"         to android.hardware.Sensor.TYPE_LIGHT,
+                "pressure"      to android.hardware.Sensor.TYPE_PRESSURE,
+                "linear_accel"  to android.hardware.Sensor.TYPE_LINEAR_ACCELERATION,
+                "rotation"      to android.hardware.Sensor.TYPE_ROTATION_VECTOR,
+                "step_counter"  to android.hardware.Sensor.TYPE_STEP_COUNTER,
+            )
+            for ((label, type) in sensors) {
+                field("sensor.${label}_present",
+                    "SensorManager.getDefaultSensor($label)" jLayer {
+                        (sm?.getDefaultSensor(type) != null).toString()
+                    },
+                )
+            }
+
+            // 指纹硬件(图 4)
+            field("sensor.fingerprint_hw_detected",
+                "FingerprintManager.isHardwareDetected" jLayer {
+                    runCatching {
+                        @Suppress("DEPRECATION")
+                        val fm = context.getSystemService(android.content.Context.FINGERPRINT_SERVICE)
+                            as? android.hardware.fingerprint.FingerprintManager
+                        @Suppress("DEPRECATION")
+                        fm?.isHardwareDetected.toString()
+                    }.getOrElse { "<denied>" }
+                },
+            )
+            // 通过 PackageManager 探测指纹/相机/GPS hardware feature
+            for ((label, feature) in listOf(
+                "feature.fingerprint" to android.content.pm.PackageManager.FEATURE_FINGERPRINT,
+                "feature.camera"      to android.content.pm.PackageManager.FEATURE_CAMERA,
+                "feature.location_gps" to android.content.pm.PackageManager.FEATURE_LOCATION_GPS,
+                "feature.telephony"   to android.content.pm.PackageManager.FEATURE_TELEPHONY,
+                "feature.bluetooth"   to android.content.pm.PackageManager.FEATURE_BLUETOOTH,
+                "feature.nfc"         to android.content.pm.PackageManager.FEATURE_NFC,
+            )) {
+                field(label,
+                    "PackageManager.hasSystemFeature" jLayer {
+                        context.packageManager.hasSystemFeature(feature).toString()
+                    },
+                )
+            }
+        }
+
+        // ============================================================
+        // Q. 网络异常变量(Phase H,图 4 篡改行为变量)
+        //    黑产挂代理 / VPN / 改 WiFi 是常见手段,商业 SDK 必检
+        // ============================================================
+        category("network-quirks") {
+            field("network.proxy_host",
+                "System.getProperty(http.proxyHost)" jLayer {
+                    val h = System.getProperty("http.proxyHost") ?: ""
+                    val p = System.getProperty("http.proxyPort") ?: ""
+                    if (h.isEmpty()) "<none>" else "$h:$p"
+                },
+            )
+            field("network.vpn_active",
+                "ConnectivityManager NET_CAPABILITY_NOT_VPN absent" jLayer {
+                    runCatching {
+                        val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                            as? android.net.ConnectivityManager
+                        val active = cm?.activeNetwork ?: return@runCatching "false"
+                        val caps = cm.getNetworkCapabilities(active) ?: return@runCatching "false"
+                        // VPN 激活时 NOT_VPN 能力被 absent
+                        (!caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN))
+                            .toString()
+                    }.getOrElse { "<denied>" }
+                },
+            )
+            // WiFi 周围 SSID 数(图 1 wifilnfoList)— 真用户家里常 5-20 个,机器人房常 0-1
+            // Android 10+ 要 ACCESS_FINE_LOCATION;Android 13+ 进一步要 NEARBY_WIFI_DEVICES。
+            // getScanResults 返回 cache,空时主动 startScan() 再读(Android 9+ 节流到 2min)
+            field("wifi.surrounding_count",
+                "WifiManager.scanResults (after startScan)" jLayer {
+                    runCatching {
+                        @Suppress("DEPRECATION")
+                        val wm = context.applicationContext
+                            .getSystemService(android.content.Context.WIFI_SERVICE)
+                            as? android.net.wifi.WifiManager
+                        if (wm == null) return@runCatching "<null>"
+                        var results = wm.scanResults
+                        if (results.isNullOrEmpty()) {
+                            @Suppress("DEPRECATION")
+                            wm.startScan()  // Android 9+ 节流,可能也是 false
+                            Thread.sleep(800)
+                            results = wm.scanResults
+                        }
+                        "${results?.size ?: 0} (wifi_enabled=${wm.isWifiEnabled})"
+                    }.getOrElse { "<denied> ${it.javaClass.simpleName}" }
+                },
+            )
+            // DNS 拆 2 独立字段(不做跨源对比 — VPN/代理 active 时两者本来就不相等,
+            // 那种"不一致"是有意义的信号,不是 verify bug)
+            // 直接派生 dns.via_vpn 字段告诉风控:active DNS != WiFi DHCP DNS = VPN active
+            fun activeDns(): String {
+                val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                    as? android.net.ConnectivityManager
+                val active = cm?.activeNetwork ?: return ""
+                val lp = cm.getLinkProperties(active) ?: return ""
+                return lp.dnsServers.joinToString(",") { it.hostAddress ?: "?" }
+            }
+            fun dhcpDns(): String {
+                @Suppress("DEPRECATION")
+                val wm = context.applicationContext
+                    .getSystemService(android.content.Context.WIFI_SERVICE)
+                    as? android.net.wifi.WifiManager
+                @Suppress("DEPRECATION")
+                val d = wm?.dhcpInfo ?: return ""
+                fun ipStr(i: Int): String = if (i == 0) "" else
+                    "${i and 0xff}.${(i shr 8) and 0xff}.${(i shr 16) and 0xff}.${(i shr 24) and 0xff}"
+                return listOf(d.dns1, d.dns2).map(::ipStr).filter { it.isNotEmpty() }.joinToString(",")
+            }
+            field("network.dns.active",
+                "ConnectivityManager.linkProperties.dnsServers" jLayer { activeDns() },
+            )
+            field("network.dns.wifi_dhcp",
+                "WifiManager.dhcpInfo.dns1/2" jLayer { dhcpDns() },
+            )
+            // ★ 关键派生:active DNS 跟 WiFi DHCP DNS 不一致 = VPN/proxy 隧道改了 DNS
+            //   商业风控强信号(独立于 NET_CAPABILITY_NOT_VPN 检测,绕得过 VPN 检测的代理这里也漏)
+            field("network.dns.via_vpn_or_proxy",
+                "active_dns != wifi_dhcp_dns" jLayer {
+                    val a = activeDns(); val w = dhcpDns()
+                    when {
+                        a.isEmpty() || w.isEmpty() -> "unknown (a=$a, w=$w)"
+                        a == w -> "false"
+                        else -> "true (active=$a, dhcp=$w)"
+                    }
+                },
+            )
+        }
+
+        // ============================================================
+        // R. APP 清单变量(Phase H,图 4 — 黑产工具识别)
+        //    商业 SDK 探测黑产工具类 app 是否安装,直接判定用户类型
+        //    Android 11+ 包可见性需要 <queries> 声明,getPackageInfo 会抛
+        //    NameNotFoundException;verify 没声明这些 → 永远未装(false positive)。
+        //    用 getInstalledPackages 全列表搜更可靠(verify 有 QUERY_ALL_PACKAGES 才行)
+        // ============================================================
+        category("app-presence") {
+            val installedPkgs = runCatching {
+                context.packageManager.getInstalledPackages(0).map { it.packageName }.toSet()
+            }.getOrElse { emptySet() }
+
+            val riskCategories = mapOf(
+                "loan" to listOf(  // 信贷/借款类(部分常见)
+                    "com.tencent.lemon", "com.youxiabank.pro", "com.jdcn.fido.appdownloader",
+                    "com.alibaba.amap", "com.haier.cellularData",
+                ),
+                "sms_bomber" to listOf(  // 短信轰炸(国内常见名)
+                    "com.cjwsc.smsbomber", "io.github.snhua.smsbom", "com.sms.bomber",
+                ),
+                "location_spoof" to listOf(
+                    "com.lerist.fakelocation", "com.evozi.injector", "com.theappninjas.fakegpsjoystick",
+                    "com.lexa.fakegps", "com.fakegps.mock", "com.incorporateapps.fakegps_route",
+                ),
+                "phone_changer" to listOf(  // 改号软件
+                    "com.unison.phone.changer", "com.fakecall.app",
+                ),
+                "gambling" to listOf(  // 赌博类(国内黑产常见)
+                    "com.thirteen.poker", "com.qcplay.dz",
+                ),
+                "automation" to listOf(  // 自动化工具
+                    "com.zzz.acc", "io.appium.settings", "io.appium.uiautomator2.server",
+                    "com.willowtreeapps.fuzz", "ru.yanus171.android.LaunchAutomate",
+                    "com.qihoo.autoclick", "auto.js.com.stardust",
+                ),
+                "root_manager" to listOf(  // root 管理 app
+                    "com.topjohnwu.magisk", "me.weishu.kernelsu", "io.github.huskydg.magisk",
+                ),
+            )
+
+            for ((cat, pkgs) in riskCategories) {
+                val hits = pkgs.filter { it in installedPkgs }
+                field("app.has_$cat",
+                    "PackageManager.getInstalledPackages contains" jLayer {
+                        if (hits.isEmpty()) "false" else "true (${hits.joinToString(",")})"
+                    },
+                )
+            }
+            field("app.installed_count",
+                "getInstalledPackages.size" jLayer { installedPkgs.size.toString() },
+            )
         }
 
         // ============================================================

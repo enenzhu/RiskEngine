@@ -135,6 +135,24 @@ class MainActivity : AppCompatActivity() {
                 arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE, Manifest.permission.READ_PHONE_STATE),
                 1)
         }
+
+        // Phase H runtime permissions:WiFi scan results 需要 location 危险权限
+        // (Android 10+ 强制),其它 normal/signature 权限装包时给。
+        val needed = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            for (perm in listOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+                Manifest.permission.READ_PHONE_STATE,
+            )) {
+                if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
+                    needed += perm
+                }
+            }
+            if (needed.isNotEmpty()) {
+                ActivityCompat.requestPermissions(this, needed.toTypedArray(), 2)
+            }
+        }
     }
 
     private fun runCollection() {
@@ -179,11 +197,12 @@ class MainActivity : AppCompatActivity() {
                 btnCollect.isEnabled = true
                 lastReport = ghostReport
                 lastSdkReport = sdkReport
+                val (hiRisk, lowRisk) = countRisk(ghostReport)
                 tvSummary.text = buildString {
                     append("✅ 采集完成\n")
                     append("ghost: ${ghostCost}ms / SDK: ${sdkCost}ms\n")
                     append("设备: ${ghostReport.deviceLabel}\n")
-                    append("ghost 字段: ${ghostReport.fieldCount}, ❌不一致: ${ghostReport.inconsistentCount}\n")
+                    append("ghost 字段: ${ghostReport.fieldCount}, ❌不一致: ${ghostReport.inconsistentCount}, 🚨高危: $hiRisk, ⚠风险: $lowRisk\n")
                     if (sdkReport != null) {
                         append("SDK 风险等级: ${sdkReport.overallRiskLevel}, 分数: ${sdkReport.riskScore}/${sdkReport.maxRiskScore}\n")
                         append("SDK 检测: ⚠️${sdkReport.warningCount} / 🚨${sdkReport.dangerCount}\n")
@@ -253,16 +272,79 @@ class MainActivity : AppCompatActivity() {
     private fun trunc(s: String?, maxLen: Int = 100): String =
         s?.let { if (it.length > maxLen) it.take(maxLen) + "…" else it } ?: "<null>"
 
-    /** 单个 field 渲染:✅/❌ name = value;不一致时展开各 source */
+    /**
+     * 风险标记:把已知风险信号(VPN / proxy / hook / 缺锁屏 / 装黑产 app)从 ghost-verify
+     * field value 解读出来。返回:
+     *   "🚨 ..." 高风险(明确是 anchor / 工具特征)
+     *   "⚠ ..."  中风险(可疑配置 / 测试机特征)
+     *   null    无风险
+     * 默认 ✅/❌ 只看 cross-source consistency 不够 — 例如 vpn_active=true 单 source 一致
+     * 但显然是高风险,不该打 ✅。
+     */
+    private fun riskTag(f: FieldResult): String? {
+        val v = f.canonicalValue ?: return null
+        return when (f.name) {
+            // === 网络异常(VPN/代理) ===
+            "network.vpn_active" -> if (v == "true") "🚨 VPN 激活" else null
+            "network.dns.via_vpn_or_proxy" ->
+                if (v.startsWith("true")) "🚨 DNS 走 VPN/代理隧道" else null
+            "network.proxy_host" -> if (v != "<none>") "🚨 HTTP 代理已设" else null
+            // === Hook 框架检测 ===
+            "magisk.detected","root.detected","frida.detected","xposed.detected",
+            "lsposed.detected" -> if (v != "false") "🚨 ${f.name.substringBefore('.')} 检测到" else null
+            "emulator.detected" -> if (v != "false") "🚨 模拟器" else null
+            "anti_evasion.stacktrace_xposed","anti_evasion.pm_call_stack" ->
+                if (v != "clean") "🚨 stack 含 hook 框架痕迹" else null
+            "debugger.attached" -> if (v.contains("true")) "🚨 调试器附加" else null
+            "selinux.mode" -> if (v != "enforcing" && v != "1") "🚨 SELinux 非 enforcing" else null
+            // === 风控奇葩 ===
+            "keyguard.is_secure" -> if (v == "false") "⚠ 未设锁屏密码" else null
+            "build_prop.mtime_secure" ->
+                if (!v.startsWith("secure=true")) "🚨 build.prop 被改" else null
+            "app_market.packages" ->
+                if (v == "com.android.vending") "⚠ 缺 OEM 应用市场" else null
+            "major_apps.installtime" ->
+                if (v == "<none-installed>") "⚠ 主流 app 全没装" else null
+            "wifi.surrounding_count" -> {
+                val n = Regex("\\d+").find(v)?.value?.toIntOrNull()
+                if (n != null && n <= 1) "⚠ WiFi 周围 SSID ≤ 1" else null
+            }
+            // === 黑产 app ===
+            "app.has_loan","app.has_sms_bomber","app.has_location_spoof",
+            "app.has_phone_changer","app.has_gambling","app.has_automation",
+            "app.has_root_manager" ->
+                if (v.startsWith("true")) "🚨 装了 ${f.name.removePrefix("app.has_")} 类 app" else null
+            else -> null
+        }
+    }
+
+    /** 单个 field 渲染:🚨/⚠/❌/✅ + name + value;risk/不一致 时展开各 source */
     private fun renderField(sb: StringBuilder, f: FieldResult, expandSources: Boolean) {
-        val mark = if (f.consistent) "✅" else "❌"
-        sb.append("  $mark ${f.name} = ${trunc(f.canonicalValue)}\n")
-        if (expandSources || !f.consistent) {
+        val risk = riskTag(f)
+        val mark = when {
+            risk?.startsWith("🚨") == true -> "🚨"
+            risk?.startsWith("⚠") == true -> "⚠ "
+            !f.consistent -> "❌"
+            else -> "✅"
+        }
+        sb.append("  $mark ${f.name} = ${trunc(f.canonicalValue)}")
+        if (risk != null) sb.append("  ← $risk")
+        sb.append("\n")
+        if (expandSources || !f.consistent || risk != null) {
             f.sources.forEach { s ->
                 val sLabel = if (s.source.isNotEmpty()) " (${trunc(s.source, 40)})" else ""
                 sb.append("      ${s.layer.padEnd(7)}$sLabel = ${trunc(s.value)}\n")
             }
         }
+    }
+
+    private fun countRisk(report: CollectReport): Pair<Int, Int> {
+        var hi = 0; var lo = 0
+        for (f in report.fields) {
+            val r = riskTag(f) ?: continue
+            if (r.startsWith("🚨")) hi++ else if (r.startsWith("⚠")) lo++
+        }
+        return hi to lo
     }
 
     private fun formatSummary(
