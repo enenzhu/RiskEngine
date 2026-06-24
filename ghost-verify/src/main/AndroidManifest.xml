@@ -20,6 +20,8 @@
     <!-- Phase H: app-presence 黑产 app 探测,Android 11+ 需要 QUERY_ALL_PACKAGES -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
+    <!-- GSF Android ID — content://com.google.android.gsf.gservices 受这个 normal 权限保护 -->
+    <uses-permission android:name="com.google.android.providers.gsf.permission.READ_GSERVICES" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"

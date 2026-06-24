@@ -59,5 +59,9 @@ dependencies {
     implementation(libs.appcompat)
     implementation(libs.material)
     implementation(libs.gson)
+    // GAID — AdvertisingIdClient 类来自这个 aar(非 GMS app 本身导出),
+    // 不引入则 Class.forName("com.google.android.gms.ads.identifier.AdvertisingIdClient")
+    // 抛 ClassNotFoundException,verify 拿不到 GAID
+    implementation(libs.play.services.ads.identifier)
     implementation(project(":riskengine-sdk"))
 }
