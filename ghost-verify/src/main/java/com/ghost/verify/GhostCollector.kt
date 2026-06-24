@@ -1110,6 +1110,28 @@ class GhostCollector(private val context: Context) {
                     }.getOrElse { "<denied>" }
                 },
             )
+            // 当前已连 WiFi 的 SSID/BSSID/MAC — ghost WifiServiceHook 应 spoof,真值不该泄露
+            // GMS / Gmail 等 system app 有 location 权限,这些 API 拿到的是真值,必须 spoof
+            // 真用户家里 WiFi SSID 跨次稳定(一辈子不换路由器名);ghost 应该返同样的 spoof 值
+            val wm = runCatching {
+                context.applicationContext.getSystemService(android.content.Context.WIFI_SERVICE)
+                    as? android.net.wifi.WifiManager
+            }.getOrNull()
+            field("wifi.connected_ssid",
+                "WifiManager.connectionInfo.ssid" jLayer {
+                    runCatching { wm?.connectionInfo?.ssid ?: "<null>" }.getOrElse { "<denied> ${it.javaClass.simpleName}" }
+                },
+            )
+            field("wifi.connected_bssid",
+                "WifiManager.connectionInfo.bssid" jLayer {
+                    runCatching { wm?.connectionInfo?.bssid ?: "<null>" }.getOrElse { "<denied> ${it.javaClass.simpleName}" }
+                },
+            )
+            field("wifi.mac_address",
+                "WifiManager.connectionInfo.macAddress" jLayer {
+                    runCatching { wm?.connectionInfo?.macAddress ?: "<null>" }.getOrElse { "<denied> ${it.javaClass.simpleName}" }
+                },
+            )
             // WiFi 周围 SSID 数(图 1 wifilnfoList)— 真用户家里常 5-20 个,机器人房常 0-1
             // Android 10+ 要 ACCESS_FINE_LOCATION;Android 13+ 进一步要 NEARBY_WIFI_DEVICES。
             // getScanResults 返回 cache,空时主动 startScan() 再读(Android 9+ 节流到 2min)
