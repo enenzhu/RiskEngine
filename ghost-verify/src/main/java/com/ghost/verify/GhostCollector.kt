@@ -1312,6 +1312,214 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // X. 风控攻击视角探测(bytesFighting 文章)
+        //   模拟商业风控 SDK 真实读取路径,任何字段跨源不一致 = ghost 漏 hook
+        // ============================================================
+
+        // X.1 — 7 作用域 fingerprint 同源检查
+        // 文章原文:"很多大厂会收集 7 个 partition 的 fingerprint... Hook 的话也需要全部进行 hook,只处理单一是没用的"
+        // ghost 在 BuildHook.buildSysPropMap 已覆盖 7 partition,这里跨次采集自动验证
+        category("partition-fingerprints") {
+            val partitions = listOf("build", "bootimage", "odm", "product", "system_ext", "system", "vendor")
+            for (key in listOf("fingerprint", "id", "version.incremental")) {
+                val props = partitions.map { p -> "ro.$p.build.$key" }
+                val sources = props.map { prop ->
+                    prop nLayer { NativeBridge.getSystemProperty(prop) }
+                }.toMutableList<SourceValue>()
+                // 主路径 ro.build.{key}(无 partition 前缀)也加进来
+                val mainProp = "ro.build.$key"
+                sources.add(0, mainProp nLayer { NativeBridge.getSystemProperty(mainProp) })
+                field("partition_same.$key", *sources.toTypedArray())
+            }
+        }
+
+        // X.2 — SystemProperties 多路径绕过检测
+        // 文章原文:"如果只 Hook __system_property_get... 大厂在 9+ 直接调 system_properties.Get 或 find+read"
+        // 加 __system_property_find+read / popen getprop / build.prop 文件直读 三路对比
+        category("sysprop-bypass") {
+            val critProps = listOf(
+                "ro.build.fingerprint",
+                "ro.product.manufacturer",
+                "ro.product.brand",
+                "ro.product.model",
+                "ro.build.version.security_patch",
+                "ro.serialno",
+            )
+            for (prop in critProps) {
+                // 同时四路径,确保 ghost 全部 hook
+                field("prop_via_paths.$prop",
+                    "SystemProperties.get(java)" jLayer {
+                        runCatching {
+                            val cls = Class.forName("android.os.SystemProperties")
+                            cls.getMethod("get", String::class.java).invoke(null, prop) as? String ?: ""
+                        }.getOrElse { "" }
+                    },
+                    "__system_property_get(native)" nLayer { NativeBridge.getSystemProperty(prop) },
+                    "__system_property_find+read(native bypass)" nLayer { NativeBridge.getSystemPropertyViaFind(prop) },
+                    "popen getprop" nLayer {
+                        NativeBridge.execShell("getprop $prop", 256).trim()
+                    },
+                )
+            }
+        }
+
+        // X.3 — build.prop 文件可见性探针(不做 stat vs read 跨源比对)
+        // 文章原文:"低版本 build.prop 直接 fopen 能读"。但 Android 10+:
+        //   - /system/build.prop, /vendor/build.prop, /odm/etc/build.prop 默认 mode=600 root only
+        //   - SELinux 进一步拒绝普通 app uid 读取
+        //   - 商业风控 SDK 不会要求 root,所以走这条的 spoof 检查也读不到
+        // 因此 stat 看到 size 但 read 失败是**真实 Linux 权限行为**,不是 ghost 漏洞。
+        // 我们把 stat / read 各自作为独立字段记录,不强制一致(单值 field 永远 consistent)。
+        // 真正的攻击面是 system_ext/etc/build.prop(mode=644 可读)— 但它只含 OEM extra
+        // prop,不含 ro.build.fingerprint,这里只做 sanity 不做断言。
+        category("buildprop-files") {
+            val buildPropFiles = listOf(
+                "/system/build.prop",
+                "/vendor/build.prop",
+                "/odm/etc/build.prop",
+                "/product/build.prop",
+                "/system_ext/etc/build.prop",
+            )
+            for (f in buildPropFiles) {
+                val tag = f.substringAfter('/').replace('/', '_').substringBefore('.')
+                field("buildprop_stat.$tag",
+                    "stat $f" nLayer { NativeBridge.statFile(f).ifEmpty { "<not-exist>" } },
+                )
+                field("buildprop_read.$tag",
+                    "fopen $f → grep ro.build.fingerprint" nLayer {
+                        val content = NativeBridge.readFile(f, 16384)
+                        when {
+                            content.isEmpty() -> "<empty/no-perm>"  // 预期(mode=600 + SELinux)
+                            else -> content.lines()
+                                .firstOrNull { it.startsWith("ro.build.fingerprint=") }
+                                ?.substringAfter('=')
+                                ?: "<readable-but-no-fingerprint-key>"  // system_ext 等预期
+                        }
+                    },
+                )
+            }
+        }
+
+        // X.4 — popen 命令探测(模拟风控走 execve/popen 绕过)
+        // 文章原文:"很多大厂会执行 popen logcat / getprop / uname -a / ip a / ps -ef / df grep magisk"
+        category("popen-probes") {
+            // uname.release 是核心字段(spoof 后 ghost 改 syscall uname → release 跟着改)
+            // syscall release + popen uname -r 都应该返回同样的 release 字符串(归一化对比);
+            // /proc/version Android 11+ 受 SELinux 限制普通 app 读不到 = 预期空,不参与一致性
+            field("uname.release",
+                "syscall uname().release" nLayer { NativeBridge.getUname().getOrNull(2) ?: "" },
+                "popen uname -r" nLayer { NativeBridge.execShell("uname -r", 512).trim() },
+            )
+            // 单独字段记录,不强制比对
+            field("uname.full_uname_a",
+                "popen uname -a" nLayer { NativeBridge.execShell("uname -a", 512).trim() },
+            )
+            field("uname.proc_version",
+                "fopen /proc/version" nLayer {
+                    val v = NativeBridge.readFile("/proc/version", 512).trim()
+                    v.ifEmpty { "<empty/no-perm — expected on Android 11+>" }
+                },
+            )
+            // popen getprop ro.product.model 跟 SystemProperties.get 对比
+            field("popen.getprop_model",
+                "SystemProperties.get(ro.product.model)" jLayer { android.os.Build.MODEL },
+                "popen getprop" nLayer { NativeBridge.execShell("getprop ro.product.model", 256).trim() },
+            )
+            // popen ps -ef 看是否有 ghost / magisk / xposed / frida 痕迹
+            field("popen.ps_clean",
+                "popen ps -A | grep [hook]" nLayer {
+                    val out = NativeBridge.execShell("ps -A", 16384)
+                    val hits = out.lines().filter { line ->
+                        listOf("magisk", "zygisk", "frida", "lsposed", "xposed", "sukisu", "kernelsu")
+                            .any { kw -> kw in line.lowercase() }
+                    }
+                    if (hits.isEmpty()) "clean" else "🚨 ${hits.size} hits: ${hits.joinToString(";").take(180)}"
+                },
+            )
+            // popen mount grep magisk
+            field("popen.mount_clean",
+                "popen mount | grep magisk|.abcd|/data/adb" nLayer {
+                    val out = NativeBridge.execShell("mount", 16384)
+                    val hits = out.lines().filter { line ->
+                        listOf("magisk", ".abcd", "/data/adb").any { kw -> kw in line.lowercase() }
+                    }
+                    if (hits.isEmpty()) "clean" else "🚨 ${hits.size} hits: ${hits.joinToString(";").take(180)}"
+                },
+            )
+            // popen ip a — netlink 路径的 mac
+            field("popen.ip_a",
+                "popen ip a | grep link/ether" nLayer {
+                    val out = NativeBridge.execShell("ip addr 2>/dev/null || ip -a", 16384)
+                    val macLines = out.lines().filter { it.contains("link/ether") }.map { it.trim() }
+                    if (macLines.isEmpty()) "<empty>" else macLines.joinToString(" | ").take(280)
+                },
+            )
+        }
+
+        // X.5 — 内核文件 ID 采集(boot_id / uuid / soc_serial / emmc_cid / misc)
+        // 文章:"很多大厂会读取 boot_id / soc_serial / mmcblk0/device/cid / proc/misc 作为指纹"
+        // ghost 应该 SVC IO 重定向这些路径,这里采集让任何 spoof 漏的立刻可见
+        category("kernel-ids") {
+            val coreIdFiles = listOf(
+                "kernel.boot_id" to "/proc/sys/kernel/random/boot_id",
+                "kernel.random_uuid" to "/proc/sys/kernel/random/uuid",
+                "hw.soc_serial" to "/sys/devices/soc0/serial_number",
+                "hw.emmc_cid" to "/sys/block/mmcblk0/device/cid",
+                "hw.emmc_serial" to "/sys/block/mmcblk0/device/serial",
+                "hw.emmc_name" to "/sys/block/mmcblk0/device/name",
+                "kernel.misc" to "/proc/misc",
+                "kernel.cmdline" to "/proc/cmdline",
+                "kernel.osrelease" to "/proc/sys/kernel/osrelease",
+                "kernel.hostname" to "/proc/sys/kernel/hostname",
+            )
+            // 这些字段大多是 root-only(SELinux+mode 拒绝普通 app),read 跟 popen cat 都
+            // 走 fopen / cat 底层都是 openat,SELinux 一致拒绝 → 两源同空。
+            // 例外:/proc/sys/kernel/random/uuid 是 Linux 内核接口,**每次读返回新 UUID**(
+            // 这是 kernel rand 设计行为,跟 boot_id 不同),所以两源必不同 — 不做 cross 比对。
+            for ((name, path) in coreIdFiles) {
+                if (name == "kernel.random_uuid") {
+                    // /proc/sys/kernel/random/uuid 每次读都新值,只采单源,不做一致性
+                    field(name,
+                        "readFile $path" nLayer {
+                            val v = NativeBridge.readFile(path, 1024).trim()
+                            if (v.isEmpty()) "<empty/no-perm>" else "$v (per-read-varying — Linux kernel behavior)"
+                        },
+                    )
+                } else {
+                    field(name,
+                        "readFile $path" nLayer {
+                            val v = NativeBridge.readFile(path, 1024).trim()
+                            v.ifEmpty { "<empty/no-perm>" }
+                        },
+                        "popen cat $path" nLayer {
+                            val v = NativeBridge.execShell("cat $path 2>/dev/null", 1024).trim()
+                            v.ifEmpty { "<empty/no-perm>" }
+                        },
+                    )
+                }
+            }
+            // /proc/self/maps 找 ghost / magisk / lsposed / frida 痕迹
+            field("maps.clean",
+                "readFile /proc/self/maps | grep [hook]" nLayer {
+                    val maps = NativeBridge.readFile("/proc/self/maps", 65536)
+                    val hits = maps.lines().mapNotNull {
+                        val low = it.lowercase()
+                        when {
+                            "libplay" in low -> "libplay"
+                            "magisk" in low -> "magisk"
+                            "lspd" in low || "lsposed" in low -> "lsposed"
+                            "lsplant" in low -> "lsplant"
+                            "frida" in low -> "frida"
+                            "zygisk" in low -> "zygisk"
+                            else -> null
+                        }
+                    }.distinct()
+                    if (hits.isEmpty()) "clean" else "🚨 ${hits.joinToString(",")}"
+                },
+            )
+        }
+
+        // ============================================================
         // 收尾 — 构建 report
         // ============================================================
         val timestamp = System.currentTimeMillis()

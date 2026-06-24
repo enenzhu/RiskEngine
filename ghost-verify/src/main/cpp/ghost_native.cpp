@@ -45,6 +45,57 @@ Java_com_ghost_verify_NativeBridge_getSystemProperty(JNIEnv* env, jclass, jstrin
 }
 
 // ============================================================
+// getSystemPropertyViaFind: 走 __system_property_find + __system_property_read
+// 第二条 native sysprop 读取路径 — 攻击者(大厂风控)用这个绕过仅 hook 了
+// __system_property_get 的 spoof。文章原话:"大厂在 android 9 以上会直接调用
+// system_properties.Get... 如果只 Hook __system_property_get 的话可能就会导致指纹泄漏"
+// ghost 应该两条路径都 hook,否则这里跟 getSystemProperty 不一致 = ghost 漏 hook
+// ============================================================
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ghost_verify_NativeBridge_getSystemPropertyViaFind(JNIEnv* env, jclass, jstring jkey) {
+    if (!jkey) return env->NewStringUTF("");
+    const char* key = env->GetStringUTFChars(jkey, nullptr);
+    const prop_info* pi = __system_property_find(key);
+    env->ReleaseStringUTFChars(jkey, key);
+    if (!pi) return env->NewStringUTF("");
+    char name[PROP_NAME_MAX] = {0};
+    char value[PROP_VALUE_MAX] = {0};
+    int len = __system_property_read(pi, name, value);
+    if (len <= 0) return env->NewStringUTF("");
+    return env->NewStringUTF(value);
+}
+
+// ============================================================
+// execShell: popen() 执行 shell 命令,fgets 读取 stdout
+// 模拟商业风控 SDK 走 popen 路径绕过 Java/getSystemProperty hook —
+// 文章列的 getprop / uname -a / cat /sys/devices/soc0/serial_number / ip a /
+// ps -ef / df grep magisk 等都走这条。execve(底层是 svc_openat),所以 ghost
+// SVC IO 重定向有没有覆盖通过这个能立刻看出来。
+// ============================================================
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ghost_verify_NativeBridge_execShell(JNIEnv* env, jclass, jstring jcmd, jint maxBytes) {
+    if (!jcmd) return env->NewStringUTF("");
+    const char* cmd = env->GetStringUTFChars(jcmd, nullptr);
+    FILE* fp = popen(cmd, "r");
+    if (!fp) {
+        env->ReleaseStringUTFChars(jcmd, cmd);
+        return env->NewStringUTF("");
+    }
+    const int cap = maxBytes > 0 && maxBytes < 65536 ? maxBytes : 32768;
+    std::vector<char> buf(cap + 1, 0);
+    size_t total = 0;
+    while (total < (size_t) cap) {
+        size_t n = fread(buf.data() + total, 1, cap - total, fp);
+        if (n == 0) break;
+        total += n;
+    }
+    pclose(fp);
+    env->ReleaseStringUTFChars(jcmd, cmd);
+    buf[total] = 0;
+    return env->NewStringUTF(buf.data());
+}
+
+// ============================================================
 // readFile: 直接 fopen,绕过 Java IO 抽象
 // ============================================================
 extern "C" JNIEXPORT jstring JNICALL
