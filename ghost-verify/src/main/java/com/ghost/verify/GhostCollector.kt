@@ -1611,6 +1611,53 @@ class GhostCollector(private val context: Context) {
                     }.getOrElse { "<error>" }
                 },
             )
+            // 终极验证:外部 echo 服务返回观察到的真实 JA3 hash(从 packet wire 算出)。
+            // tls.peet.ws/api/all 是公开服务,GET 返回 JSON 含 ja3_hash 跟 ja4。
+            // 这是 ghost JA3 hook 是否真生效的金标准 — Java enabledCipherSuites 走 Java 配置
+            // 静态值,看不到 native hook 效果;但 packet wire 上的 Client Hello cipher 顺序
+            // 是被 hook 改写的真实值,服务端 JA3 hash 跟着 ghost spoof 顺序变。
+            // 跨次一键新机时,这里 ja3_hash 跟着 deviceInfo 变化 = JA3 聚集性 anchor 被破坏。
+            field("tls.observed_ja3_external",
+                "GET https://tls.peet.ws/api/all → server-observed JA3 / JA4" jLayer {
+                    runCatching {
+                        val url = java.net.URL("https://tls.peet.ws/api/all")
+                        val conn = url.openConnection() as javax.net.ssl.HttpsURLConnection
+                        conn.connectTimeout = 8000
+                        conn.readTimeout = 8000
+                        conn.requestMethod = "GET"
+                        val body = conn.inputStream.bufferedReader().use { it.readText() }
+                        conn.disconnect()
+                        // 简化 JSON 解析:抓 ja3_hash / ja4 字段
+                        val ja3 = Regex("\"ja3_hash\"\\s*:\\s*\"([a-f0-9]+)\"").find(body)?.groupValues?.get(1) ?: "?"
+                        val ja4 = Regex("\"ja4\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.get(1) ?: "?"
+                        "ja3=$ja3 / ja4=$ja4"
+                    }.getOrElse { "<error> ${it.javaClass.simpleName}: ${it.message?.take(60)}" }
+                },
+            )
+            // 关键升级:实际发起 SSL handshake 拿协商成功的 cipher + Client Hello
+            // enabledCipherSuites。这条路径才会走 BoringSSL native SSL_CTX_set_cipher_list,
+            // 跟 ghost 的 JA3 hook 路径重合 — hook 生效后这里 cipher 顺序/hash 跟着变。
+            // 静态 SSLContext.defaultSSLParameters 不走这条 native 路径,看不到 hook 效果。
+            field("tls.actual_handshake",
+                "real SSL handshake → SSLSocket.enabledCiphers sha1[0:16]" jLayer {
+                    runCatching {
+                        val factory = javax.net.ssl.SSLSocketFactory.getDefault() as javax.net.ssl.SSLSocketFactory
+                        val sock = factory.createSocket("www.google.com", 443) as javax.net.ssl.SSLSocket
+                        sock.soTimeout = 5000
+                        sock.startHandshake()
+                        val negotiated = sock.session.cipherSuite
+                        val enabled = sock.enabledCipherSuites
+                        sock.close()
+                        val joined = enabled.joinToString(",")
+                        val hash = java.security.MessageDigest.getInstance("SHA-1")
+                            .digest(joined.toByteArray()).joinToString("") { "%02x".format(it) }
+                        "${enabled.size} ciphers, neg=$negotiated, sha1[0:16]=${hash.take(16)}"
+                    }.getOrElse { "<error> ${it.javaClass.simpleName}: ${it.message}" }
+                },
+            )
+            // 跨 ghost hook 的对照 — 这个 enabledCipherSuites 经过 SSLSocket native 路径
+            // 跟 ghost SSL_set_cipher_list hook 可能重合(如果 SSLSocket 内部走 BoringSSL
+            // 的 set_cipher_list 配置 ctx)。看跟 tls.actual_handshake 的 hash 是否一致。
         }
 
         // ============================================================
