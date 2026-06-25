@@ -63,5 +63,7 @@ dependencies {
     // 不引入则 Class.forName("com.google.android.gms.ads.identifier.AdvertisingIdClient")
     // 抛 ClassNotFoundException,verify 拿不到 GAID
     implementation(libs.play.services.ads.identifier)
+    // OkHttp 走 HTTP/2 拿 peet.ws 返回的 akamai_fingerprint(Java HttpsURLConnection 只 h1)
+    implementation(libs.okhttp)
     implementation(project(":riskengine-sdk"))
 }

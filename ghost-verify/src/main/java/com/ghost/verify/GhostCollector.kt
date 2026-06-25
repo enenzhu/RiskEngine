@@ -1617,21 +1617,48 @@ class GhostCollector(private val context: Context) {
             // 静态值,看不到 native hook 效果;但 packet wire 上的 Client Hello cipher 顺序
             // 是被 hook 改写的真实值,服务端 JA3 hash 跟着 ghost spoof 顺序变。
             // 跨次一键新机时,这里 ja3_hash 跟着 deviceInfo 变化 = JA3 聚集性 anchor 被破坏。
+            // 关键升级:用 OkHttp 走 HTTP/2 调 peet.ws,服务端从 packet 算 JA3 + JA4 +
+            // **akamai HTTP/2 fingerprint**(只 HTTP/2 流才有)。akamai_fingerprint 是
+            // HTTP/2 SETTINGS frame 参数 + WINDOW_UPDATE + PRIORITY + pseudo-header 顺序的
+            // 复合指纹,商业风控用作"HTTP/2 客户端类型"识别(类似 JA3 但在 HTTP/2 协议层)。
+            // 单次请求把 ja3 / ja4 / akamai 一起 cache,避免发 2 次。
+            val peetResponse: String by lazy {
+                runCatching {
+                    val client = okhttp3.OkHttpClient.Builder()
+                        .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                        .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+                        .protocols(listOf(okhttp3.Protocol.HTTP_2, okhttp3.Protocol.HTTP_1_1))
+                        .build()
+                    val req = okhttp3.Request.Builder().url("https://tls.peet.ws/api/all").get().build()
+                    client.newCall(req).execute().use { it.body?.string() ?: "" }
+                }.getOrElse { "<error> ${it.javaClass.simpleName}: ${it.message?.take(60)}" }
+            }
+            fun extract(key: String): String =
+                Regex("\"$key\"\\s*:\\s*\"([^\"]+)\"").find(peetResponse)?.groupValues?.get(1) ?: "?"
+
             field("tls.observed_ja3_external",
-                "GET https://tls.peet.ws/api/all → server-observed JA3 / JA4" jLayer {
-                    runCatching {
-                        val url = java.net.URL("https://tls.peet.ws/api/all")
-                        val conn = url.openConnection() as javax.net.ssl.HttpsURLConnection
-                        conn.connectTimeout = 8000
-                        conn.readTimeout = 8000
-                        conn.requestMethod = "GET"
-                        val body = conn.inputStream.bufferedReader().use { it.readText() }
-                        conn.disconnect()
-                        // 简化 JSON 解析:抓 ja3_hash / ja4 字段
-                        val ja3 = Regex("\"ja3_hash\"\\s*:\\s*\"([a-f0-9]+)\"").find(body)?.groupValues?.get(1) ?: "?"
-                        val ja4 = Regex("\"ja4\"\\s*:\\s*\"([^\"]+)\"").find(body)?.groupValues?.get(1) ?: "?"
-                        "ja3=$ja3 / ja4=$ja4"
-                    }.getOrElse { "<error> ${it.javaClass.simpleName}: ${it.message?.take(60)}" }
+                "OkHttp(HTTP/2) GET tls.peet.ws/api/all → server-observed ja3/ja4" jLayer {
+                    if (peetResponse.startsWith("<error>")) peetResponse
+                    else "ja3=${extract("ja3_hash")} / ja4=${extract("ja4")}"
+                },
+            )
+            field("tls.observed_akamai_h2",
+                "akamai HTTP/2 fingerprint (SETTINGS|WINDOW_UPDATE|PRIORITY|pseudo-hdr order)" jLayer {
+                    if (peetResponse.startsWith("<error>")) peetResponse
+                    else {
+                        // peet.ws 返回 "akamai_fingerprint": "1:65536,3:1000,4:6291456,6:262144|15663105|0|m,s,a,p"
+                        // 字段:S=SETTINGS / WU=WINDOW_UPDATE delta / P=PRIORITY weight / PS=pseudo-header order
+                        val fp = extract("akamai_fingerprint")
+                        val hash = extract("akamai_fingerprint_hash")
+                        if (fp == "?" && hash == "?") "<no-h2 — falled back to HTTP/1.1>"
+                        else "hash=$hash fp=${fp.take(80)}"
+                    }
+                },
+            )
+            field("tls.http_protocol_to_peet",
+                "OkHttp negotiated protocol with tls.peet.ws" jLayer {
+                    if (peetResponse.startsWith("<error>")) peetResponse
+                    else extract("http_version").ifEmpty { "?" }
                 },
             )
             // 关键升级:实际发起 SSL handshake 拿协商成功的 cipher + Client Hello
