@@ -22,6 +22,17 @@ object NativeBridge {
      */
     external fun execShell(cmd: String, maxBytes: Int = 32768): String
 
+    /**
+     * 完全用内联汇编 svc #0 调 __NR_openat + __NR_read + __NR_close 读文件,绕过
+     * libc 层任何 hook。Article 3(simpread-安卓 Svc 穿透获取设备信息)核心攻击:
+     * libc fopen/open/openat hook 都无效,svc #0 直接 trap 内核态。ghost 当前
+     * KernelSU.redirectIO 必须在 svc 层做才有效,否则两源不一致 = ghost 漏 hook。
+     */
+    external fun readFileViaSyscall(path: String, maxBytes: Int = 4096): String
+
+    /** 同 statFile,但走 svc #0 调 __NR_newfstatat 绕过 libc hook */
+    external fun statFileViaSyscall(path: String): String
+
     /** 直接 fopen,绕过 Java IO 抽象。maxBytes 默认 64KB */
     external fun readFile(path: String, maxBytes: Int = 65536): String
 

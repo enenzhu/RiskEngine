@@ -1520,6 +1520,100 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // Y. Article 3 — SVC raw syscall 绕 libc hook 对比
+        //   asm svc #0 直接 trap 到内核态,跟 libc fopen 拿到不同结果 = ghost 只
+        //   hook 了 libc 没拦 svc。商业风控用 raw svc 拿真值。
+        // ============================================================
+        category("svc-bypass") {
+            val targets = listOf(
+                "/proc/self/status" to "proc.self.status",
+                "/proc/version" to "proc.version",
+                "/proc/sys/kernel/random/boot_id" to "boot_id",
+                "/sys/class/net/wlan0/address" to "net.wlan0.address",
+                "/system/build.prop" to "system.build_prop",
+            )
+            for ((path, tag) in targets) {
+                field("svc_vs_libc.$tag",
+                    "libc fopen" nLayer {
+                        NativeBridge.readFile(path, 4096).trim().take(120).ifEmpty { "<empty>" }
+                    },
+                    "asm svc #0 openat" nLayer {
+                        NativeBridge.readFileViaSyscall(path, 4096).trim().take(120).ifEmpty { "<empty>" }
+                    },
+                )
+            }
+            // stat 也对比一下,看 ghost svc IO 重定向是否覆盖 stat 路径
+            field("svc_stat_vs_libc.build_prop",
+                "libc stat" nLayer { NativeBridge.statFile("/system/build.prop").ifEmpty { "<empty>" } },
+                "asm svc #0 newfstatat" nLayer { NativeBridge.statFileViaSyscall("/system/build.prop").ifEmpty { "<empty>" } },
+            )
+        }
+
+        // ============================================================
+        // Z. Article 2 — JA3 TLS Client Hello 客户端指纹采集(单源,不做 cross)
+        //   反射 SSLContext default 的 cipher suites + protocols,拼成 JA3 风格的
+        //   PartialClientHello 字符串,供分析跟"真实 Android Chrome / OkHttp" JA3
+        //   比对。商业风控用 JA3 识破自动化工具(curl/python requests/cronet 等)
+        //   各自有独立指纹。
+        // ============================================================
+        category("ja3-tls") {
+            field("tls.protocols",
+                "SSLContext default protocols" jLayer {
+                    runCatching {
+                        val ctx = javax.net.ssl.SSLContext.getDefault()
+                        ctx.defaultSSLParameters.protocols.sorted().joinToString(",")
+                    }.getOrElse { "<error> ${it.javaClass.simpleName}" }
+                },
+            )
+            field("tls.ciphers_enabled",
+                "SSLContext default enabled cipher suites" jLayer {
+                    runCatching {
+                        val ctx = javax.net.ssl.SSLContext.getDefault()
+                        val ciphers = ctx.defaultSSLParameters.cipherSuites.sorted()
+                        // 数量 + hash(前 8 chars)— 不全列(列出来 100+ 太长)
+                        val joined = ciphers.joinToString(",")
+                        val hash = java.security.MessageDigest.getInstance("SHA-1")
+                            .digest(joined.toByteArray())
+                            .joinToString("") { "%02x".format(it) }
+                        "${ciphers.size} cipher_suites, sha1[0:16]=${hash.take(16)}"
+                    }.getOrElse { "<error> ${it.javaClass.simpleName}" }
+                },
+            )
+            field("tls.cipher_top5",
+                "first 5 default cipher suites(sorted)" jLayer {
+                    runCatching {
+                        val ctx = javax.net.ssl.SSLContext.getDefault()
+                        ctx.defaultSSLParameters.cipherSuites.sorted().take(5).joinToString(",")
+                    }.getOrElse { "<error> ${it.javaClass.simpleName}" }
+                },
+            )
+            // Conscrypt(Android 默认 SSL provider)身份探针
+            field("tls.provider",
+                "SSLContext default provider" jLayer {
+                    runCatching {
+                        val ctx = javax.net.ssl.SSLContext.getDefault()
+                        "${ctx.protocol} / ${ctx.provider.name} v${ctx.provider.version}"
+                    }.getOrElse { "<error> ${it.javaClass.simpleName}" }
+                },
+            )
+            // 跟 Android 13 / 14 标准 Chrome JA3 简单比对:
+            // 真 Android 13 Conscrypt 通常报告 TLSv1.2/TLSv1.3 + ~17 个 cipher
+            // 数量异常少(<10)或缺主流套件 = 客户端用了非标准 SSL stack(可能 hook 框架/沙箱)
+            field("tls.cipher_count_normal",
+                "is cipher count reasonable for Android 13+" jLayer {
+                    runCatching {
+                        val n = javax.net.ssl.SSLContext.getDefault().defaultSSLParameters.cipherSuites.size
+                        when {
+                            n < 10 -> "⚠ too few ($n) — possibly stripped SSL stack"
+                            n > 60 -> "⚠ unusually high ($n) — non-standard provider?"
+                            else -> "normal ($n)"
+                        }
+                    }.getOrElse { "<error>" }
+                },
+            )
+        }
+
+        // ============================================================
         // 收尾 — 构建 report
         // ============================================================
         val timestamp = System.currentTimeMillis()

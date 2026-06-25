@@ -18,6 +18,9 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/system_properties.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <android/log.h>
@@ -244,6 +247,94 @@ static int phdr_cb_collect(struct dl_phdr_info* info, size_t, void* data) {
         ctx->names->emplace_back(info->dlpi_name);
     }
     return 0;
+}
+
+// ============================================================
+// raw_syscall — 内联汇编 svc #0,绕过 libc 任何 hook
+// Article 3 的核心攻击向量:libc open/read/openat 被 hook 也无效,
+// svc #0 直接 trap 到内核,只有 ptrace / kernel 模块能拦截。
+// ghost 当前 svc IO 重定向(KernelSU.redirectIO)如果做得完整,
+// 这个 raw syscall 跟 fopen 应该拿到同样的结果;不一致 = ghost
+// 只 hook 了 libc 层没拦 svc 层,商业风控立刻识破。
+// ============================================================
+#if defined(__aarch64__)
+static inline long raw_syscall6(long n, long a, long b, long c, long d, long e, long f) {
+    register long x8 asm("x8") = n;
+    register long x0 asm("x0") = a;
+    register long x1 asm("x1") = b;
+    register long x2 asm("x2") = c;
+    register long x3 asm("x3") = d;
+    register long x4 asm("x4") = e;
+    register long x5 asm("x5") = f;
+    asm volatile("svc #0"
+        : "+r"(x0)
+        : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+        : "memory", "cc");
+    return x0;
+}
+#else
+// 32 位 armv7 — 用 libc syscall() wrapper(可能被 hook,但 ghost 主要跑 arm64,
+// 这里仅 fallback)
+static inline long raw_syscall6(long n, long a, long b, long c, long d, long e, long f) {
+    return syscall(n, a, b, c, d, e, f);
+}
+#endif
+
+// ============================================================
+// readFileViaSyscall: 完全用 raw svc syscall 读文件(绕 libc)
+// openat(AT_FDCWD, path, O_RDONLY) → read 循环 → close,全走 svc #0
+// ============================================================
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ghost_verify_NativeBridge_readFileViaSyscall(JNIEnv* env, jclass, jstring jpath, jint maxBytes) {
+    if (!jpath) return env->NewStringUTF("");
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    long fd = raw_syscall6(__NR_openat, (long) AT_FDCWD, (long) path, (long) O_RDONLY, 0, 0, 0);
+    if (fd < 0) {
+        env->ReleaseStringUTFChars(jpath, path);
+        return env->NewStringUTF("");
+    }
+    const int cap = maxBytes > 0 && maxBytes < 65536 ? maxBytes : 4096;
+    std::vector<char> buf(cap + 1, 0);
+    long total = 0;
+    while (total < cap) {
+        long n = raw_syscall6(__NR_read, fd, (long)(buf.data() + total), (long)(cap - total), 0, 0, 0);
+        if (n <= 0) break;
+        total += n;
+    }
+    raw_syscall6(__NR_close, fd, 0, 0, 0, 0, 0);
+    env->ReleaseStringUTFChars(jpath, path);
+    buf[total] = 0;
+    return env->NewStringUTF(buf.data());
+}
+
+// ============================================================
+// statFileViaSyscall: 完全用 raw svc syscall 跑 newfstatat(绕 libc)
+// 给 ghost svc IO 重定向 stat 路径做完整性验证。
+// ============================================================
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ghost_verify_NativeBridge_statFileViaSyscall(JNIEnv* env, jclass, jstring jpath) {
+    if (!jpath) return env->NewStringUTF("");
+    const char* path = env->GetStringUTFChars(jpath, nullptr);
+    long rc;
+    char outbuf[128] = {0};
+#if defined(__aarch64__)
+    // arm64 用 newfstatat(AT_FDCWD, path, &st, 0)
+    struct stat st {};
+    rc = raw_syscall6(SYS_newfstatat, (long) AT_FDCWD, (long) path, (long) &st, 0, 0, 0);
+    env->ReleaseStringUTFChars(jpath, path);
+    if (rc != 0) return env->NewStringUTF("");
+    snprintf(outbuf, sizeof(outbuf), "size=%lld,mtime=%lld,mode=%o",
+             (long long) st.st_size, (long long) st.st_mtime, st.st_mode & 0777);
+#else
+    // armv7 没 newfstatat,fallback 走 fstatat64 — libc 包装可能被 hook,但 32 位很少跑
+    struct stat64 st64 {};
+    rc = syscall(SYS_fstatat64, AT_FDCWD, path, &st64, 0);
+    env->ReleaseStringUTFChars(jpath, path);
+    if (rc != 0) return env->NewStringUTF("");
+    snprintf(outbuf, sizeof(outbuf), "size=%lld,mtime=%lld,mode=%o",
+             (long long) st64.st_size, (long long) st64.st_mtime, st64.st_mode & 0777);
+#endif
+    return env->NewStringUTF(outbuf);
 }
 
 extern "C" JNIEXPORT jobjectArray JNICALL
