@@ -71,6 +71,49 @@ class GhostCollector(private val context: Context) {
                 "ro.product.system.model" nLayer { NativeBridge.getSystemProperty("ro.product.system.model") },
                 "ro.product.vendor.model" nLayer { NativeBridge.getSystemProperty("ro.product.vendor.model") },
             )
+            // === Marketing Name (营销名) — OEM 私有 sysprop ===
+            // ghost 一键新机时按 manufacturer 设当前 OEM 的 marketname,屏蔽其他 OEM 的。
+            // 风控点:多 OEM key 必须满足"当前 OEM 对应 key 非空 + 其他 OEM key 都空"。
+            // 物理机自带 key(例物理 vivo 真机 ro.vivo.product.marketname)若未被屏蔽 = 反向暴露。
+            field("MARKETNAME_VIVO",
+                "ro.vivo.product.marketname" nLayer { NativeBridge.getSystemProperty("ro.vivo.product.marketname") },
+                "ro.product.vivo.marketname" nLayer { NativeBridge.getSystemProperty("ro.product.vivo.marketname") },
+                "SystemProperties.get(ro.vivo.product.marketname)" jLayer {
+                    runCatching {
+                        val cls = Class.forName("android.os.SystemProperties")
+                        cls.getMethod("get", String::class.java).invoke(null, "ro.vivo.product.marketname") as String
+                    }.getOrNull()
+                },
+                "getprop ro.vivo.product.marketname" sLayer { getpropShell("ro.vivo.product.marketname") },
+            )
+            field("MARKETNAME_XIAOMI",
+                "ro.product.marketname" nLayer { NativeBridge.getSystemProperty("ro.product.marketname") },
+                "SystemProperties.get(ro.product.marketname)" jLayer {
+                    runCatching {
+                        val cls = Class.forName("android.os.SystemProperties")
+                        cls.getMethod("get", String::class.java).invoke(null, "ro.product.marketname") as String
+                    }.getOrNull()
+                },
+                "getprop ro.product.marketname" sLayer { getpropShell("ro.product.marketname") },
+            )
+            field("MARKETNAME_SAMSUNG",
+                "ro.product.model_marketing" nLayer { NativeBridge.getSystemProperty("ro.product.model_marketing") },
+                "SystemProperties.get(ro.product.model_marketing)" jLayer {
+                    runCatching {
+                        val cls = Class.forName("android.os.SystemProperties")
+                        cls.getMethod("get", String::class.java).invoke(null, "ro.product.model_marketing") as String
+                    }.getOrNull()
+                },
+                "getprop ro.product.model_marketing" sLayer { getpropShell("ro.product.model_marketing") },
+            )
+            field("MARKETNAME_HUAWEI",
+                "ro.config.marketing_name" nLayer { NativeBridge.getSystemProperty("ro.config.marketing_name") },
+                "getprop ro.config.marketing_name" sLayer { getpropShell("ro.config.marketing_name") },
+            )
+            field("MARKETNAME_MIUI_MOD_DEVICE",
+                "ro.product.mod_device" nLayer { NativeBridge.getSystemProperty("ro.product.mod_device") },
+                "getprop ro.product.mod_device" sLayer { getpropShell("ro.product.mod_device") },
+            )
             field("PRODUCT",
                 "Build.PRODUCT" jLayer { Build.PRODUCT },
                 "ro.product.name" nLayer { NativeBridge.getSystemProperty("ro.product.name") },
@@ -282,6 +325,330 @@ class GhostCollector(private val context: Context) {
             )
             field("display_info_cache_key",
                 "cache_key.display_info" nLayer { NativeBridge.getSystemProperty("cache_key.display_info") },
+            )
+
+            // ----------------------------------------------------------------
+            // 多源 width/height/dpi 检测 — 验证 wm size + 兜底 hook 完整性
+            // wm size 持久化通过 Settings.forced + WindowManager.setForced* API,
+            // 风控可以通过多条路径绕过 wm size override 拿真物理屏幕,这里把所有
+            // 已知的检测向量全列出来,看 ghost 漏没漏。
+            // ----------------------------------------------------------------
+
+            // (1) Resources.getDisplayMetrics 全字段
+            field("resources_display_metrics_full",
+                "Resources.getDisplayMetrics" jLayer {
+                    val dm = context.resources.displayMetrics
+                    "${dm.widthPixels}x${dm.heightPixels} density=${dm.density} dpi=${dm.densityDpi} xdpi=${dm.xdpi} ydpi=${dm.ydpi}"
+                },
+            )
+
+            // (2) Resources.getConfiguration screenWidthDp/HeightDp/densityDpi
+            field("resources_configuration",
+                "Resources.getConfiguration" jLayer {
+                    val cfg = context.resources.configuration
+                    "w=${cfg.screenWidthDp}dp h=${cfg.screenHeightDp}dp smallest=${cfg.smallestScreenWidthDp}dp dpi=${cfg.densityDpi}"
+                },
+            )
+
+            // (3) WindowMetrics.getBounds (Android 11+)
+            field("window_metrics_current_bounds",
+                "WindowManager.getCurrentWindowMetrics().getBounds()" jLayer {
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        val b = wm.currentWindowMetrics.bounds
+                        "${b.width()}x${b.height()}"
+                    } else "N/A_API<30"
+                },
+            )
+
+            // (4) WindowMetrics.getMaximumWindowMetrics — 物理最大可用区
+            field("window_metrics_maximum_bounds",
+                "WindowManager.getMaximumWindowMetrics().getBounds()" jLayer {
+                    if (Build.VERSION.SDK_INT >= 30) {
+                        val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        val b = wm.maximumWindowMetrics.bounds
+                        "${b.width()}x${b.height()}"
+                    } else "N/A_API<30"
+                },
+            )
+
+            // (5) WindowMetrics.getDensity (Android 14+)
+            field("window_metrics_density",
+                "WindowMetrics.getDensity()" jLayer {
+                    if (Build.VERSION.SDK_INT >= 34) {
+                        val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        wm.currentWindowMetrics.density.toString()
+                    } else "N/A_API<34"
+                },
+            )
+
+            // (6) IWindowManager.getInitialDisplaySize — wm size override 之前的物理真值
+            //     ghost client-side hook 拦截,应该返 spoof
+            field("iwm_initial_display_size",
+                "IWindowManager.getInitialDisplaySize" jLayer {
+                    runCatching {
+                        val sm = Class.forName("android.os.ServiceManager")
+                        val binder = sm.getMethod("getService", String::class.java).invoke(null, "window")
+                        val iwm = Class.forName("android.view.IWindowManager\$Stub")
+                            .getMethod("asInterface", Class.forName("android.os.IBinder")).invoke(null, binder)
+                        val pt = android.graphics.Point()
+                        Class.forName("android.view.IWindowManager")
+                            .getMethod("getInitialDisplaySize", Int::class.javaPrimitiveType, android.graphics.Point::class.java)
+                            .invoke(iwm, 0, pt)
+                        "${pt.x}x${pt.y}"
+                    }.getOrElse { "ERR:${it.message}" }
+                },
+            )
+
+            // (7) IWindowManager.getBaseDisplaySize
+            field("iwm_base_display_size",
+                "IWindowManager.getBaseDisplaySize" jLayer {
+                    runCatching {
+                        val sm = Class.forName("android.os.ServiceManager")
+                        val binder = sm.getMethod("getService", String::class.java).invoke(null, "window")
+                        val iwm = Class.forName("android.view.IWindowManager\$Stub")
+                            .getMethod("asInterface", Class.forName("android.os.IBinder")).invoke(null, binder)
+                        val pt = android.graphics.Point()
+                        Class.forName("android.view.IWindowManager")
+                            .getMethod("getBaseDisplaySize", Int::class.javaPrimitiveType, android.graphics.Point::class.java)
+                            .invoke(iwm, 0, pt)
+                        "${pt.x}x${pt.y}"
+                    }.getOrElse { "ERR:${it.message}" }
+                },
+            )
+
+            // (8) IWindowManager.getInitialDisplayDensity
+            field("iwm_initial_display_density",
+                "IWindowManager.getInitialDisplayDensity" jLayer {
+                    runCatching {
+                        val sm = Class.forName("android.os.ServiceManager")
+                        val binder = sm.getMethod("getService", String::class.java).invoke(null, "window")
+                        val iwm = Class.forName("android.view.IWindowManager\$Stub")
+                            .getMethod("asInterface", Class.forName("android.os.IBinder")).invoke(null, binder)
+                        Class.forName("android.view.IWindowManager")
+                            .getMethod("getInitialDisplayDensity", Int::class.javaPrimitiveType)
+                            .invoke(iwm, 0).toString()
+                    }.getOrElse { "ERR:${it.message}" }
+                },
+            )
+
+            // (9) IWindowManager.getBaseDisplayDensity
+            field("iwm_base_display_density",
+                "IWindowManager.getBaseDisplayDensity" jLayer {
+                    runCatching {
+                        val sm = Class.forName("android.os.ServiceManager")
+                        val binder = sm.getMethod("getService", String::class.java).invoke(null, "window")
+                        val iwm = Class.forName("android.view.IWindowManager\$Stub")
+                            .getMethod("asInterface", Class.forName("android.os.IBinder")).invoke(null, binder)
+                        Class.forName("android.view.IWindowManager")
+                            .getMethod("getBaseDisplayDensity", Int::class.javaPrimitiveType)
+                            .invoke(iwm, 0).toString()
+                    }.getOrElse { "ERR:${it.message}" }
+                },
+            )
+
+            // (10) Settings.Global.DISPLAY_SIZE_FORCED — wm size 持久化痕迹
+            //      ghost SettingsProviderHook 拦截 hookpkg uid,应返 null
+            field("settings_global_display_size_forced",
+                "Settings.Global.getString(DISPLAY_SIZE_FORCED)" jLayer {
+                    Settings.Global.getString(context.contentResolver, "display_size_forced") ?: "null"
+                },
+            )
+
+            // (11) Settings.Secure.DISPLAY_DENSITY_FORCED
+            field("settings_secure_display_density_forced",
+                "Settings.Secure.getString(DISPLAY_DENSITY_FORCED)" jLayer {
+                    Settings.Secure.getString(context.contentResolver, "display_density_forced") ?: "null"
+                },
+            )
+
+            // (12) /sys/class/graphics/fb0/virtual_size — 内核 framebuffer 真物理 px
+            //      多源 fopen / svc syscall / popen 对比
+            field("sysfs_fb0_virtual_size",
+                "fopen /sys/class/graphics/fb0/virtual_size" pLayer {
+                    NativeBridge.readFile("/sys/class/graphics/fb0/virtual_size", 256).trim()
+                },
+                "svc openat /sys/class/graphics/fb0/virtual_size" pLayer {
+                    NativeBridge.readFileViaSyscall("/sys/class/graphics/fb0/virtual_size", 256).trim()
+                },
+                "popen cat /sys/class/graphics/fb0/virtual_size" pLayer {
+                    NativeBridge.execShell("cat /sys/class/graphics/fb0/virtual_size 2>/dev/null", 256).trim()
+                },
+            )
+
+            // (13) /sys/class/graphics/fb0/mode — 显示模式
+            field("sysfs_fb0_mode",
+                "fopen /sys/class/graphics/fb0/mode" pLayer {
+                    NativeBridge.readFile("/sys/class/graphics/fb0/mode", 512).trim()
+                },
+                "svc openat /sys/class/graphics/fb0/mode" pLayer {
+                    NativeBridge.readFileViaSyscall("/sys/class/graphics/fb0/mode", 512).trim()
+                },
+                "popen cat /sys/class/graphics/fb0/mode" pLayer {
+                    NativeBridge.execShell("cat /sys/class/graphics/fb0/mode 2>/dev/null", 512).trim()
+                },
+            )
+
+            // (14) /sys/class/graphics/fb0/modes — 可用模式列表
+            field("sysfs_fb0_modes",
+                "fopen /sys/class/graphics/fb0/modes" pLayer {
+                    NativeBridge.readFile("/sys/class/graphics/fb0/modes", 2048).trim().take(500)
+                },
+                "popen cat /sys/class/graphics/fb0/modes" pLayer {
+                    NativeBridge.execShell("cat /sys/class/graphics/fb0/modes 2>/dev/null", 2048).trim().take(500)
+                },
+            )
+
+            // (15) /sys/class/graphics/fb0/bits_per_pixel
+            field("sysfs_fb0_bpp",
+                "fopen /sys/class/graphics/fb0/bits_per_pixel" pLayer {
+                    NativeBridge.readFile("/sys/class/graphics/fb0/bits_per_pixel", 32).trim()
+                },
+            )
+
+            // (16) ls /sys/class/graphics/ — 列所有 fb 设备
+            field("sysfs_graphics_listing",
+                "popen ls /sys/class/graphics" pLayer {
+                    NativeBridge.execShell("ls /sys/class/graphics/ 2>/dev/null", 512).trim()
+                },
+            )
+
+            // (17) dumpsys display — 命令路径,部分 SDK 用(需要权限,通常 app 拿不到完整)
+            field("dumpsys_display_size",
+                "popen dumpsys display | grep mBaseDisplayInfo" pLayer {
+                    NativeBridge.execShell(
+                        "dumpsys display 2>/dev/null | grep -iE 'mBaseDisplayInfo|mInitialDisplay|width=|height=' | head -10",
+                        2048
+                    ).trim().take(500)
+                },
+            )
+
+            // (18) wm size / wm density 命令(需要 system 权限,普通 app 拿不到)
+            field("wm_size_cmd",
+                "popen wm size" pLayer {
+                    NativeBridge.execShell("wm size 2>&1", 256).trim()
+                },
+            )
+            field("wm_density_cmd",
+                "popen wm density" pLayer {
+                    NativeBridge.execShell("wm density 2>&1", 256).trim()
+                },
+            )
+
+            // ----------------------------------------------------------------
+            // Display 对象的特殊路径(老 DisplayHook 覆盖过的 GMS / 风控独立路径)
+            // ----------------------------------------------------------------
+
+            // (19) Display.getRealMetrics — 风控主路径(@deprecated 但仍在用)
+            field("display_get_real_metrics",
+                "Display.getRealMetrics" jLayer {
+                    val dm = DisplayMetrics()
+                    @Suppress("DEPRECATION")
+                    (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay
+                        .getRealMetrics(dm)
+                    "${dm.widthPixels}x${dm.heightPixels} dpi=${dm.densityDpi} density=${dm.density}"
+                },
+            )
+
+            // (20) Display.getRealSize — Point 版本,GMS getStableDisplaySize 类似
+            field("display_get_real_size",
+                "Display.getRealSize" jLayer {
+                    val pt = android.graphics.Point()
+                    @Suppress("DEPRECATION")
+                    (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay
+                        .getRealSize(pt)
+                    "${pt.x}x${pt.y}"
+                },
+            )
+
+            // (21) Display.getMode().getPhysicalWidth/Height — 物理 mode(老 hook 必盖)
+            field("display_get_mode_physical",
+                "Display.getMode().{physicalWidth,physicalHeight,refreshRate}" jLayer {
+                    @Suppress("DEPRECATION")
+                    val mode = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
+                        .defaultDisplay.mode
+                    "${mode.physicalWidth}x${mode.physicalHeight}@${mode.refreshRate}Hz"
+                },
+            )
+
+            // (22) Display.getSupportedModes — 全部支持 mode 列表
+            field("display_get_supported_modes",
+                "Display.getSupportedModes" jLayer {
+                    @Suppress("DEPRECATION")
+                    val modes = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
+                        .defaultDisplay.supportedModes
+                    modes.joinToString("|") { "${it.physicalWidth}x${it.physicalHeight}@${"%.1f".format(it.refreshRate)}" }
+                        .take(400)
+                },
+            )
+
+            // (23) DisplayManager.getStableDisplaySize — GMS 主路径(getStableDisplaySize hook)
+            field("display_manager_stable_display_size",
+                "DisplayManager.getStableDisplaySize" jLayer {
+                    runCatching {
+                        val dmgr = context.getSystemService(Context.DISPLAY_SERVICE)
+                        val pt = dmgr.javaClass.getMethod("getStableDisplaySize").invoke(dmgr) as android.graphics.Point
+                        "${pt.x}x${pt.y}"
+                    }.getOrElse { "ERR:${it.message}" }
+                },
+            )
+
+            // (24) Display.getName / getDisplayId(辅助识别 default vs 其他 display)
+            field("display_identity",
+                "Display.id+name+flags" jLayer {
+                    @Suppress("DEPRECATION")
+                    val d = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay
+                    "id=${d.displayId} name=${d.name} flags=${d.flags}"
+                },
+            )
+
+            // (25) Display.refreshRate / getMode().refreshRate — 跨方法一致性
+            field("display_refresh_rate",
+                "Display.getRefreshRate" jLayer {
+                    @Suppress("DEPRECATION")
+                    val d = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay
+                    d.refreshRate.toString()
+                },
+            )
+
+            // (26) DisplayMetrics.setToDefaults() 之后的 density(老 hook 覆盖此时机注入 DENSITY_DEVICE_STABLE)
+            field("display_metrics_set_to_defaults",
+                "new DisplayMetrics().setToDefaults() 后 densityDpi" jLayer {
+                    val dm = DisplayMetrics()
+                    dm.setToDefaults()
+                    "${dm.widthPixels}x${dm.heightPixels} dpi=${dm.densityDpi}"
+                },
+            )
+
+            // (27) Configuration.densityDpi 静态(Resources.getSystem() 全局)
+            field("system_resources_configuration",
+                "Resources.getSystem().getConfiguration()" jLayer {
+                    val cfg = android.content.res.Resources.getSystem().configuration
+                    "w=${cfg.screenWidthDp}dp h=${cfg.screenHeightDp}dp dpi=${cfg.densityDpi}"
+                },
+            )
+
+            // (28) DisplayInfo via DisplayManagerGlobal.getDisplayInfo (反射 hidden API,GMS 用)
+            field("display_manager_global_display_info",
+                "DisplayManagerGlobal.getDisplayInfo(0).logicalWidth/Height/DensityDpi" jLayer {
+                    runCatching {
+                        val dmgClass = Class.forName("android.hardware.display.DisplayManagerGlobal")
+                        val instance = dmgClass.getMethod("getInstance").invoke(null)
+                        val info = dmgClass.getMethod("getDisplayInfo", Int::class.javaPrimitiveType)
+                            .invoke(instance, 0)
+                        if (info == null) "null"
+                        else {
+                            val cls = info.javaClass
+                            fun fi(n: String): Int = runCatching {
+                                cls.getDeclaredField(n).apply { isAccessible = true }.getInt(info)
+                            }.getOrDefault(-1)
+                            "logical=${fi("logicalWidth")}x${fi("logicalHeight")}@${fi("logicalDensityDpi")} " +
+                            "app=${fi("appWidth")}x${fi("appHeight")} " +
+                            "physical=${fi("physicalWidth")}x${fi("physicalHeight")} " +
+                            "nominal=${fi("smallestNominalAppWidth")}x${fi("largestNominalAppHeight")}"
+                        }
+                    }.getOrElse { "ERR:${it.message}" }
+                },
             )
         }
 
