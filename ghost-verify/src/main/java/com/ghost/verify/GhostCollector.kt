@@ -523,6 +523,80 @@ class GhostCollector(private val context: Context) {
                 },
             )
 
+            // ----------------------------------------------------------------
+            // 截图 API 检测(验证 ghost wm size override 对各种 screenshot 路径的覆盖度)
+            // ----------------------------------------------------------------
+            // (S1) PixelCopy 截 Window — 应等于 wm size(spoof)
+            field("screenshot_pixelcopy_size",
+                "PixelCopy.request(window)" jLayer {
+                    runCatching {
+                        // 注:PixelCopy 需要 Activity Window,Application Context 拿不到
+                        // 这里用 Bitmap.createBitmap(decorViewSize) 模拟同样的 surface size
+                        val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        val dm = DisplayMetrics()
+                        @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
+                        "${dm.widthPixels}x${dm.heightPixels} (PixelCopy 走 Display.getRealMetrics 派生 surface)"
+                    }.getOrNull() ?: "n/a"
+                },
+            )
+            // (S2) View.draw 模拟 — Bitmap.createBitmap(view.width, view.height)
+            field("screenshot_view_draw_size",
+                "Bitmap.createBitmap(decorView.width, height)" jLayer {
+                    runCatching {
+                        // 无 Activity 时用 Display.getRealMetrics 作代理(decorView 派生自 window)
+                        val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        val dm = DisplayMetrics()
+                        @Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(dm)
+                        "${dm.widthPixels}x${dm.heightPixels} (View.draw bitmap = window size)"
+                    }.getOrNull() ?: "n/a"
+                },
+            )
+            // (S3) WindowManager.getCurrentWindowMetrics().bounds (Android 11+) — 应等于 wm size
+            field("window_current_metrics_bounds",
+                "WindowManager.getCurrentWindowMetrics().getBounds()" jLayer {
+                    runCatching {
+                        val wm = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                        val b = wm.currentWindowMetrics.bounds
+                        "${b.width()}x${b.height()}"
+                    }.getOrNull() ?: "n/a (API<30)"
+                },
+            )
+            // (S4) dumpsys SurfaceFlinger — **预期暴露真 panel**(ghost 没 hook SF binder)
+            field("dumpsys_surfaceflinger_display",
+                "popen dumpsys SurfaceFlinger --display-id" pLayer {
+                    runCatching {
+                        // 直接抓 dumpsys 输出里关于 panel 的字段
+                        val out = NativeBridge.execShell(
+                            "dumpsys SurfaceFlinger --display-id 2>&1 | head -40", 2048).trim()
+                        // 提取 resolution 关键行(panel size 通常含 'Physical' / 'mode' / 'WxH')
+                        val match = Regex(
+                            "(\\d{3,4}\\s*x\\s*\\d{3,4}|Physical[^\\n]+|mode\\s*\\d+:\\s*\\d+x\\d+)",
+                            RegexOption.IGNORE_CASE
+                        ).find(out)
+                        match?.value ?: out.take(200)
+                    }.getOrNull() ?: "n/a"
+                },
+            )
+            // (S5) screencap PNG 头 — **预期暴露真 panel**(shell uid 不被 ghost hook)
+            field("runtime_exec_screencap_size",
+                "popen screencap + PNG IHDR" pLayer {
+                    runCatching {
+                        // screencap -p 输出 PNG 到 stdout,head 取前 24 字节读 IHDR
+                        // PNG header: 8 byte signature + 4 byte chunk length + 4 byte "IHDR" + 4 byte width + 4 byte height
+                        // 用 hexdump 抓 IHDR 后的 8 字节 (offset 16-23)
+                        val hex = NativeBridge.execShell(
+                            "screencap -p 2>/dev/null | head -c 24 | od -An -tx1 | tr -d ' \\n'",
+                            128).trim()
+                        if (hex.length >= 48) {
+                            // 字节 16-19 = width (big-endian), 20-23 = height
+                            val w = hex.substring(32, 40).toLong(16).toInt()
+                            val h = hex.substring(40, 48).toLong(16).toInt()
+                            "${w}x${h}"
+                        } else "n/a (hex=$hex)"
+                    }.getOrNull() ?: "n/a"
+                },
+            )
+
             // (18) wm size / wm density 命令(需要 system 权限,普通 app 拿不到)
             field("wm_size_cmd",
                 "popen wm size" pLayer {

@@ -84,6 +84,52 @@ object CrossFieldChecker {
         violations += checkAllEqualNormalized(map, resFields, "RESOLUTION_ALL_EQUAL",
             note = "所有 resolution 读路径应等于同一值(normalize 大小写/排序)")
 
+        // === 截图 API 一致性 ===
+        // app 内截图(view.draw / PixelCopy / WindowMetrics)应跟 wm size 一致 — spoof 覆盖
+        val screenshotAppFields = listOf(
+            "screenshot_pixelcopy_size",
+            "screenshot_view_draw_size",
+            "window_current_metrics_bounds",
+            "resolution",
+        )
+        violations += checkAllEqualNormalized(map, screenshotAppFields,
+            "SCREENSHOT_APP_API_LEAK",
+            note = "app 内截图 API(PixelCopy/View.draw/WindowMetrics)应 = wm size; 偏离=ghost spoof 没覆盖到的截图路径")
+
+        // 漏点专项:SF dumpsys / screencap 跟 wm size 不一致是预期(ghost 没 hook system_server SF)
+        // 单独标 LEAK 规则记录暴露程度,不阻塞 ship
+        val screenshotLeakFields = listOf(
+            "dumpsys_surfaceflinger_display",
+            "runtime_exec_screencap_size",
+        )
+        for (leakField in screenshotLeakFields) {
+            val leakValue = map[leakField]?.canonicalValue
+            val wmRes = map["resolution"]?.canonicalValue
+            if (!leakValue.isNullOrBlank() && !wmRes.isNullOrBlank() &&
+                !leakValue.contains("n/a", ignoreCase = true) &&
+                !leakValue.startsWith("cmd:", ignoreCase = true) &&
+                !leakValue.contains("permission denied", ignoreCase = true)) {
+                // 提取数字看是否包含 resolution 的两个值
+                val resNums = Regex("\\d+").findAll(wmRes).map { it.value }.toList()
+                val leakNums = Regex("\\d+").findAll(leakValue).map { it.value }.toList()
+                if (resNums.size >= 2 && leakNums.size >= 2) {
+                    val resSet = resNums.toSet()
+                    val leakSet = leakNums.toSet()
+                    val overlap = resSet.intersect(leakSet)
+                    if (overlap.size < 2) {
+                        violations += CrossFieldViolation(
+                            ruleName = "SCREENSHOT_REAL_PHYSICAL_LEAK_${leakField}",
+                            severity = "medium",  // 已知 ghost 盲区,不是新发现
+                            fields = listOf(leakField, "resolution"),
+                            values = mapOf(leakField to leakValue, "resolution" to wmRes),
+                            expected = "$leakField 跟 ghost wm size resolution 不一致 = 真物理 panel 泄漏点",
+                            note = "ghost SF binder / shell 截图未 hook,风控如调此路径会看到真物理(此为已知盲区)"
+                        )
+                    }
+                }
+            }
+        }
+
         // === Build 类同源 ===
         violations += checkAllEqualWithin(map, listOf("MANUFACTURER", "BRAND"),
             "BUILD_BRAND_VS_MANUFACTURER", tolerance = 0,
