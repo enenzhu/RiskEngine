@@ -262,10 +262,20 @@ object CrossFieldChecker {
         // resolution 字段统一 normalize 为 "long×short" 形式
         fun normalize(v: String?): String? {
             if (v.isNullOrBlank()) return null
+            // 跳过 shell 错误字符串(权限不足/服务不存在等),不算 inconsistent
+            // 例 "cmd: Can't find service: window" / "Error: ..." / "Permission denied"
+            val lower = v.lowercase()
+            if (lower.startsWith("cmd:") || lower.startsWith("error") ||
+                lower.contains("can't find") || lower.contains("permission denied") ||
+                lower.contains("not found") || lower.contains("inaccessible")) {
+                return null  // 视为"未采集到",不参与比对
+            }
             val nums = Regex("\\d+").findAll(v).map { it.value.toInt() }.toList()
-            if (nums.size < 2) return v
+            if (nums.size < 2) return null
             val long = nums.max()
             val short = nums.min()
+            // 必须像 resolution(短边 ≥ 300,长边 ≥ 500)— 否则可能是误识别数字
+            if (short < 300 || long < 500) return null
             return "${long}x${short}"
         }
         val values = fieldNames.mapNotNull { name ->
