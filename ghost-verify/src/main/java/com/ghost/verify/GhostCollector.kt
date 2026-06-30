@@ -2059,14 +2059,16 @@ class GhostCollector(private val context: Context) {
         // ============================================================
         val timestamp = System.currentTimeMillis()
         val ts = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date(timestamp))
+        val crossViolations = CrossFieldChecker.run(fields.toList())
         return CollectReport(
             timestamp = timestamp,
             timestampHuman = ts,
             sessionId = "${Build.SERIAL.take(6)}_$ts",
             deviceLabel = "${Build.MANUFACTURER}/${Build.MODEL} (${Build.DEVICE})",
             fieldCount = fields.size,
-            inconsistentCount = fields.count { !it.consistent },
-            fields = fields.toList()
+            inconsistentCount = fields.count { !it.consistent } + crossViolations.size,
+            fields = fields.toList(),
+            crossFieldViolations = crossViolations
         )
     }
 
