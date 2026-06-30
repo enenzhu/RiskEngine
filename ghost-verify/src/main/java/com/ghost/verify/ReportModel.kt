@@ -87,10 +87,143 @@ object CrossFieldChecker {
         // === Build 类同源 ===
         violations += checkAllEqualWithin(map, listOf("MANUFACTURER", "BRAND"),
             "BUILD_BRAND_VS_MANUFACTURER", tolerance = 0,
-            allowDifferentValues = true,  // 子品牌允许不同
+            allowDifferentValues = true,
             note = "manufacturer 跟 brand 通常不同(子品牌)但都需有值")
 
+        // === fingerprint 拆解一致 ===
+        // Build.FINGERPRINT = "BRAND/PRODUCT/DEVICE:RELEASE/ID/INCREMENTAL:TYPE/TAGS"
+        val fp = map["FINGERPRINT"]?.canonicalValue
+        if (!fp.isNullOrBlank()) {
+            val parts = fp.split('/', ':').filter { it.isNotBlank() }
+            // 解析顺序:[0]=brand, [1]=product, [2]=device, [3]=release, [4]=id, [5]=incremental, [6]=type, [7]=tags
+            val fpMap = mapOf(
+                "BRAND" to parts.getOrNull(0),
+                "PRODUCT" to parts.getOrNull(1),
+                "DEVICE" to parts.getOrNull(2),
+                "RELEASE" to parts.getOrNull(3),
+                "ID" to parts.getOrNull(4),
+            )
+            for ((fieldName, fpVal) in fpMap) {
+                val actual = map[fieldName]?.canonicalValue
+                if (!fpVal.isNullOrBlank() && !actual.isNullOrBlank() && fpVal != actual) {
+                    violations += CrossFieldViolation(
+                        ruleName = "FINGERPRINT_VS_$fieldName",
+                        severity = "high",
+                        fields = listOf("FINGERPRINT", fieldName),
+                        values = mapOf("FINGERPRINT.$fieldName" to fpVal, fieldName to actual),
+                        expected = "Build.FINGERPRINT 拆解后 $fieldName 段应等于 Build.$fieldName",
+                        note = "fingerprint=$fp"
+                    )
+                }
+            }
+        }
+
+        // === SoC 同源 ===
+        violations += checkAllEqualString(map, listOf("SOC_MODEL"), listOf("ro.soc.model"),
+            "SOC_MODEL_JAVA_VS_NATIVE", note = "Build.SOC_MODEL vs ro.soc.model")
+        violations += checkAllEqualString(map, listOf("SOC_MANUFACTURER"), listOf("ro.soc.manufacturer"),
+            "SOC_MANU_JAVA_VS_NATIVE", note = "Build.SOC_MANUFACTURER vs ro.soc.manufacturer")
+        violations += checkAllEqualString(map, listOf("HARDWARE"),
+            listOf("ro.hardware", "ro.boot.hardware"),
+            "HARDWARE_JAVA_VS_NATIVE", tolerance = 0,
+            note = "Build.HARDWARE vs ro.hardware vs ro.boot.hardware")
+
+        // === SDK ↔ Release 对应 ===
+        // SDK 33→13, 34→14, 35→15, 36→16, 32→12, 31→12, 30→11, 29→10
+        val sdkToRelease = mapOf(
+            29 to "10", 30 to "11", 31 to "12", 32 to "12",
+            33 to "13", 34 to "14", 35 to "15", 36 to "16", 37 to "17",
+        )
+        val sdkInt = map["SDK_INT"]?.canonicalValue?.toIntOrNull()
+        val release = map["RELEASE"]?.canonicalValue
+        if (sdkInt != null && release != null) {
+            val expectedRelease = sdkToRelease[sdkInt]
+            if (expectedRelease != null && !release.startsWith(expectedRelease)) {
+                violations += CrossFieldViolation(
+                    ruleName = "SDK_VS_RELEASE_MISMATCH",
+                    severity = "high",
+                    fields = listOf("SDK_INT", "RELEASE"),
+                    values = mapOf("SDK_INT" to sdkInt.toString(), "RELEASE" to release),
+                    expected = "SDK=$sdkInt 对应 Android $expectedRelease",
+                    note = "Android 版本映射不一致"
+                )
+            }
+        }
+
+        // === Locale / Timezone 同源 ===
+        violations += checkAllEqualString(map, listOf("Locale.getDefault"),
+            listOf("persist.sys.locale_native", "persist.sys.locale_shell"),
+            "LOCALE_JAVA_VS_NATIVE", tolerance = 0,
+            note = "Java Locale.toString() 跟 persist.sys.locale 应同源(可能格式差 en_HK vs en-HK)",
+            normalizeLocale = true)
+        violations += checkAllEqualString(map, listOf("TimeZone.getDefault"),
+            listOf("persist.sys.timezone_native", "persist.sys.timezone_shell"),
+            "TIMEZONE_JAVA_VS_NATIVE", tolerance = 0,
+            note = "Java TimeZone.getID 跟 persist.sys.timezone 应同源")
+
+        // === SIM Country ISO 同源 ===
+        violations += checkAllEqualString(map,
+            listOf("TelephonyManager.getSimCountryIso", "TelephonyManager.getNetworkCountryIso"),
+            listOf("gsm.operator.iso-country", "gsm.sim.operator.iso-country"),
+            "SIM_COUNTRY_ISO_CROSS", tolerance = 0,
+            note = "Telephony Java API 跟 native gsm.*.iso-country 应同源(2 letter ISO)",
+            caseInsensitive = true)
+
+        // === 物理对角线合理性 ===
+        val resV = map["resolution"]?.canonicalValue
+        val dpiV = map["dpi_app_resources_java"]?.canonicalValue?.toIntOrNull()
+        if (resV != null && dpiV != null && dpiV > 0) {
+            val nums = Regex("\\d+").findAll(resV).map { it.value.toInt() }.toList()
+            if (nums.size >= 2) {
+                val w = nums.max().toDouble(); val h = nums.min().toDouble()
+                val diag = Math.sqrt(w*w + h*h) / dpiV
+                if (diag !in 4.0..8.5) {
+                    violations += CrossFieldViolation(
+                        ruleName = "PHYSICAL_DIAGONAL_OUT_OF_RANGE",
+                        severity = "high",
+                        fields = listOf("resolution", "dpi_app_resources_java"),
+                        values = mapOf("resolution" to resV, "dpi" to dpiV.toString(),
+                                       "diagonal" to "%.2f\"".format(diag)),
+                        expected = "对角线 ∈ [4.0\", 8.5\"](手机范围)",
+                        note = "可能 res 或 dpi 错配"
+                    )
+                }
+            }
+        }
+
         return violations
+    }
+
+    private fun checkAllEqualString(
+        map: Map<String, FieldResult>,
+        groupA: List<String>, groupB: List<String>,
+        ruleName: String,
+        tolerance: Int = 0,
+        caseInsensitive: Boolean = false,
+        normalizeLocale: Boolean = false,
+        note: String = ""
+    ): List<CrossFieldViolation> {
+        fun norm(v: String?): String? {
+            if (v.isNullOrBlank()) return null
+            var s: String = v
+            if (caseInsensitive) s = s.lowercase()
+            if (normalizeLocale) s = s.replace('_', '-')  // en_HK → en-HK
+            return s.trim()
+        }
+        val all = (groupA + groupB)
+        val vals = all.mapNotNull { name -> map[name]?.canonicalValue?.let { name to norm(it) } }
+            .filter { it.second != null }
+        if (vals.size < 2) return emptyList()
+        val distinct = vals.map { it.second }.toSet()
+        if (distinct.size <= 1) return emptyList()
+        return listOf(CrossFieldViolation(
+            ruleName = ruleName,
+            severity = "medium",
+            fields = all,
+            values = all.associateWith { map[it]?.canonicalValue },
+            expected = "应等价(发现 $distinct)",
+            note = note
+        ))
     }
 
     private fun checkAllEqualWithin(
