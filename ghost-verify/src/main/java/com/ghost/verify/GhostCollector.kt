@@ -1226,6 +1226,53 @@ class GhostCollector(private val context: Context) {
                         Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
                 },
             )
+            // Accessibility 多路径检测(FB SDK ACCESSIBILITY_ENABLED 走 isEnabled() Java API,
+            // ghost SettingsProviderHook 拦不到这条路径 — 验证是否有泄漏)
+            field("accessibility_is_enabled",
+                "AccessibilityManager.isEnabled()" jLayer {
+                    runCatching {
+                        val mgr = context.getSystemService(Context.ACCESSIBILITY_SERVICE)
+                            as android.view.accessibility.AccessibilityManager
+                        mgr.isEnabled.toString()
+                    }.getOrNull() ?: "n/a"
+                },
+                "AccessibilityManager.isTouchExplorationEnabled()" jLayer {
+                    runCatching {
+                        val mgr = context.getSystemService(Context.ACCESSIBILITY_SERVICE)
+                            as android.view.accessibility.AccessibilityManager
+                        mgr.isTouchExplorationEnabled.toString()
+                    }.getOrNull() ?: "n/a"
+                },
+                "Settings.Secure.accessibility_enabled" jLayer {
+                    Settings.Secure.getString(context.contentResolver,
+                        "accessibility_enabled") ?: "null"
+                },
+                "popen settings get secure accessibility_enabled" sLayer {
+                    runCatching {
+                        Runtime.getRuntime().exec(
+                            arrayOf("sh","-c","settings get secure accessibility_enabled")
+                        ).inputStream.bufferedReader().use { it.readText().trim() }
+                    }.getOrNull() ?: "n/a"
+                },
+            )
+            field("accessibility_enabled_services_count",
+                "AccessibilityManager.getEnabledAccessibilityServiceList(FEEDBACK_ALL).size" jLayer {
+                    runCatching {
+                        val mgr = context.getSystemService(Context.ACCESSIBILITY_SERVICE)
+                            as android.view.accessibility.AccessibilityManager
+                        mgr.getEnabledAccessibilityServiceList(
+                            android.accessibilityservice.AccessibilityServiceInfo.FEEDBACK_ALL_MASK
+                        ).size.toString()
+                    }.getOrNull() ?: "n/a"
+                },
+                "AccessibilityManager.getInstalledAccessibilityServiceList().size" jLayer {
+                    runCatching {
+                        val mgr = context.getSystemService(Context.ACCESSIBILITY_SERVICE)
+                            as android.view.accessibility.AccessibilityManager
+                        mgr.installedAccessibilityServiceList.size.toString()
+                    }.getOrNull() ?: "n/a"
+                },
+            )
             field("selinux.mode",
                 "/sys/fs/selinux/enforce" nLayer {
                     NativeBridge.readFile("/sys/fs/selinux/enforce", 8).trim()
