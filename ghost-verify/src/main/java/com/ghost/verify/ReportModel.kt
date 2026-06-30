@@ -108,7 +108,10 @@ object CrossFieldChecker {
             if (!leakValue.isNullOrBlank() && !wmRes.isNullOrBlank() &&
                 !leakValue.contains("n/a", ignoreCase = true) &&
                 !leakValue.startsWith("cmd:", ignoreCase = true) &&
-                !leakValue.contains("permission denied", ignoreCase = true)) {
+                !leakValue.contains("permission denied", ignoreCase = true) &&
+                !leakValue.contains("permission denial", ignoreCase = true) &&
+                !leakValue.contains("can't dump", ignoreCase = true) &&
+                !leakValue.contains("can't find service", ignoreCase = true)) {
                 // 提取数字看是否包含 resolution 的两个值
                 val resNums = Regex("\\d+").findAll(wmRes).map { it.value }.toList()
                 val leakNums = Regex("\\d+").findAll(leakValue).map { it.value }.toList()
