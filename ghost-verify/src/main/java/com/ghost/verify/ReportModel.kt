@@ -199,16 +199,8 @@ object CrossFieldChecker {
             }
         }
 
-        // === Locale / Timezone 同源 ===
-        violations += checkAllEqualString(map, listOf("Locale.getDefault"),
-            listOf("persist.sys.locale_native", "persist.sys.locale_shell"),
-            "LOCALE_JAVA_VS_NATIVE", tolerance = 0,
-            note = "Java Locale.toString() 跟 persist.sys.locale 应同源(可能格式差 en_HK vs en-HK)",
-            normalizeLocale = true)
-        violations += checkAllEqualString(map, listOf("TimeZone.getDefault"),
-            listOf("persist.sys.timezone_native", "persist.sys.timezone_shell"),
-            "TIMEZONE_JAVA_VS_NATIVE", tolerance = 0,
-            note = "Java TimeZone.getID 跟 persist.sys.timezone 应同源")
+        // === Locale / Timezone 同源 → 已由 field "locale"/"timezone" 内双源(java + persist.sys.*)自动查,
+        //     原 LOCALE_JAVA_VS_NATIVE/TIMEZONE_JAVA_VS_NATIVE 引用的是源标签("Locale.getDefault")非 field 名=死规则,删。
 
         // === SIM Country ISO 同源 → 移至 telephony 组(用真 field 名 networkCountryIso/simCountryIso)===
 
@@ -804,6 +796,48 @@ object CrossFieldChecker {
                     ),
                     expected = "client AM 报 0 个 enabled a11y service ⇒ Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES 应为空",
                     note = "AccessibilityManager hook spoof getEnabledAccessibilityServiceList→empty,但 SettingsProvider 路径漏抹→settings 仍列 service=两 hook 不同步穿帮"
+                )
+            }
+        }
+
+        // === 绕-hook 真洞交叉(hook-bypass-leaks 组)===
+        // (uptime padding 在 app 层不可检测:/proc/uptime 对 untrusted_app SELinux 拒绝,detector 同样读不到;
+        //  唯一旁路 native clock_gettime(CLOCK_BOOTTIME) 需扩 NativeBridge,未做——故无 uptime 规则。)
+        // (1) 内存:Runtime.maxMemory()/MB 按 Android 定义 == getMemoryClass();差 >32MB = ghost spoof heap 桶却没 hook getMemoryClass。
+        run {
+            val mx = map["runtime.max_memory_mb"]?.canonicalValue?.toIntOrNull()
+            val mc = map["runtime.memory_class_mb"]?.canonicalValue?.toIntOrNull()
+            if (mx != null && mc != null && mc > 0 && kotlin.math.abs(mx - mc) > 32) {
+                violations += CrossFieldViolation(
+                    ruleName = "RUNTIME_MAXMEM_VS_MEMCLASS", severity = "high",
+                    fields = listOf("runtime.max_memory_mb", "runtime.memory_class_mb"),
+                    values = mapOf("runtime.max_memory_mb" to mx.toString(), "runtime.memory_class_mb" to mc.toString()),
+                    expected = "Runtime.maxMemory()/MB ≈ ActivityManager.getMemoryClass()(Android 定义等价)",
+                    note = "maxMemory=${mx}MB vs memoryClass=${mc}MB 差 ${kotlin.math.abs(mx-mc)}MB = ghost spoof 了 Runtime heap 桶但没 hook getMemoryClass=anchor"
+                )
+            }
+        }
+        // (3) 音频:mute=false 却 volume=0 自相矛盾;volume>max 不可能。
+        run {
+            val vol = map["audio.volume_music"]?.canonicalValue?.toIntOrNull()
+            val maxVol = map["audio.max_volume_music"]?.canonicalValue?.toIntOrNull()
+            val mute = map["audio.mute_music"]?.canonicalValue
+            if (vol != null && mute == "false" && vol == 0) {
+                violations += CrossFieldViolation(
+                    ruleName = "AUDIO_MUTE_VS_VOLUME", severity = "medium",
+                    fields = listOf("audio.mute_music", "audio.volume_music"),
+                    values = mapOf("audio.mute_music" to "false", "audio.volume_music" to "0"),
+                    expected = "非静音(isStreamMute=false)时 STREAM_MUSIC volume 不应为 0",
+                    note = "ghost AudioServiceHook 伪造 volume 却恒 isStreamMute=false → mute=false+volume=0=矛盾锚"
+                )
+            }
+            if (vol != null && maxVol != null && maxVol > 0 && vol > maxVol) {
+                violations += CrossFieldViolation(
+                    ruleName = "AUDIO_VOLUME_EXCEEDS_MAX", severity = "medium",
+                    fields = listOf("audio.volume_music", "audio.max_volume_music"),
+                    values = mapOf("audio.volume_music" to vol.toString(), "audio.max_volume_music" to maxVol.toString()),
+                    expected = "getStreamVolume ≤ getStreamMaxVolume",
+                    note = "volume>max(max 是未 hook 真值)= ghost 伪造 volume 越界=anchor"
                 )
             }
         }

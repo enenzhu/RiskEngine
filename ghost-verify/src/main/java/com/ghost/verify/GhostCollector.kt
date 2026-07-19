@@ -3287,6 +3287,52 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // 绕-hook 真洞交叉:ghost 多只 hook Java 层,native/proc/未hook API 泄漏真值
+        //   (分开 field + 带容差规则,不做 exact-equal 双源 field,避免读取时间差/取整误报)
+        // ============================================================
+        category("hook-bypass-leaks") {
+            // 注:uptime padding(ghost SystemClockHook +base 拉长 elapsedRealtime)在 app 层**不可检测**:
+            //   /proc/uptime 对 untrusted_app SELinux 拒绝(实测 EACCES,同 getifaddrs),detector 自己也读不到;
+            //   唯一真实旁路是 native clock_gettime(CLOCK_BOOTTIME)——需扩 NativeBridge C++(TODO,未做)。故此处不采 uptime。
+            // 内存:Runtime.maxMemory()/MB 按 Android 定义 == ActivityManager.getMemoryClass()
+            //   ghost spoof maxMemory 到 256/384/512 桶,但常没 hook getMemoryClass → 不等=anchor
+            val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager
+            field("runtime.max_memory_mb",
+                "Runtime.maxMemory()/1MB" jLayer {
+                    (Runtime.getRuntime().maxMemory() / (1024L * 1024L)).toString()
+                },
+            )
+            field("runtime.memory_class_mb",
+                "ActivityManager.getMemoryClass()(未hook真值)" jLayer { am?.memoryClass?.toString() },
+            )
+            field("runtime.total_mem_mb",
+                "ActivityManager.MemoryInfo.totalMem/1MB" jLayer {
+                    runCatching {
+                        val mi = android.app.ActivityManager.MemoryInfo()
+                        am?.getMemoryInfo(mi); (mi.totalMem / (1024L * 1024L)).toString()
+                    }.getOrNull()
+                },
+            )
+            // 音频:mute=false 却 volume=0 = 矛盾;volume 应 ≤ max(max 是未 hook 真值)
+            val audio = context.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager
+            field("audio.volume_music",
+                "getStreamVolume(STREAM_MUSIC)" jLayer {
+                    audio?.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)?.toString()
+                },
+            )
+            field("audio.max_volume_music",
+                "getStreamMaxVolume(STREAM_MUSIC)(未hook真值)" jLayer {
+                    audio?.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)?.toString()
+                },
+            )
+            field("audio.mute_music",
+                "isStreamMute(STREAM_MUSIC)" jLayer {
+                    audio?.isStreamMute(android.media.AudioManager.STREAM_MUSIC)?.toString()
+                },
+            )
+        }
+
+        // ============================================================
         // 收尾 — 构建 report
         // ============================================================
         val timestamp = System.currentTimeMillis()
