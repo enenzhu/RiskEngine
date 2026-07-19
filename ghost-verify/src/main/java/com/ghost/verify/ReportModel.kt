@@ -275,6 +275,29 @@ object CrossFieldChecker {
                 )
             }
         }
+        // === K10 KAT 补强:固定 IV / 无 GCM tag(独立于 密文==明文,覆盖"密文≠明文但仍非真 GCM"的变体)===
+        map["crypto.two_encrypts_differ"]?.canonicalValue?.let {
+            if (it == "false") {
+                violations += CrossFieldViolation(
+                    ruleName = "KEYSTORE_FIXED_IV_OR_NOOP", severity = "medium",
+                    fields = listOf("crypto.two_encrypts_differ"),
+                    values = mapOf("crypto.two_encrypts_differ" to "false"),
+                    expected = "真 AES/GCM 每次随机 IV → 同明文两次密文应不同",
+                    note = "同明文两次加密得同密文 = 固定 IV 或空加密(ghost 常量 IV/NoEncryptionCipher)= 密码学穿帮"
+                )
+            }
+        }
+        map["crypto.gcm_tag_length_ok"]?.canonicalValue?.let {
+            if (it == "false") {
+                violations += CrossFieldViolation(
+                    ruleName = "KEYSTORE_NO_GCM_TAG", severity = "medium",
+                    fields = listOf("crypto.gcm_tag_length_ok"),
+                    values = mapOf("crypto.gcm_tag_length_ok" to "false"),
+                    expected = "AES/GCM 密文长度 == 明文 + 16(128-bit auth tag)",
+                    note = "密文长度==明文(无 16B tag)= 空加密/剥 tag,真 GCM 必带 tag = 穿帮"
+                )
+            }
+        }
 
         // ======================= 覆盖缺口补充规则(6 组)=======================
         // ============================================================

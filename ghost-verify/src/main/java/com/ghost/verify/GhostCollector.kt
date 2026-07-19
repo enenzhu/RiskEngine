@@ -1292,6 +1292,20 @@ class GhostCollector(private val context: Context) {
                     enc?.let { (it.first == plainHex).toString() }
                 },
             )
+            // ★K10 KAT:真 AES/GCM 每次随机 IV → 同明文两次密文不同;false=固定 IV 或空加密=锚。
+            field("crypto.two_encrypts_differ",
+                "同明文两次加密密文不同?(false=固定IV/空加密)" jLayer { KeystoreCryptoProbe.twoEncryptsDifferOk().toString() },
+            )
+            // ★K10 KAT:GCM 密文=明文+16B tag;false=长度==明文=无 tag=空加密。
+            field("crypto.gcm_tag_length_ok",
+                "GCM 密文长度==明文+16(tag)?(false=无tag=空加密)" jLayer { KeystoreCryptoProbe.gcmTagLengthOk().toString() },
+            )
+            // ★K9:非认证 EC keygen 公钥 SHA-256(ghost 固定内嵌→跨设备/新机同=锚;真机应 per-device 唯一+跨新机变)。
+            field("keystore.nonattest_ec_pubkey_sha256",
+                "非 challenge EC keygen 公钥 SHA-256(跨设备比对:相同=ghost 固定密钥锚)" jLayer {
+                    KeystoreCryptoProbe.nonAttestEcPubKeySha256()
+                },
+            )
         }
 
         // ============================================================

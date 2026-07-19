@@ -72,6 +72,42 @@ object KeystoreCryptoProbe {
         return decrypt(e.first, e.second) == CANARY    // 重生成的密钥能否解删前的密文
     }
 
+    /** K10 KAT:同明文两次加密密文应**不同**(真 AES/GCM 每次随机 IV);相同=固定 IV 或空加密=锚。 */
+    fun twoEncryptsDifferOk(): Boolean {
+        val a = encrypt(CANARY) ?: return false
+        val b = encrypt(CANARY) ?: return false
+        return a.first != b.first
+    }
+
+    /** K10 KAT:GCM 密文长度应 == 明文 + 16(128-bit tag);等于明文长度=无 tag=空加密(NoEncryptionCipher)。 */
+    fun gcmTagLengthOk(): Boolean {
+        val e = encrypt(CANARY) ?: return false
+        val ctLen = e.first.length / 2  // hex → 字节数
+        val ptLen = CANARY.toByteArray(Charsets.UTF_8).size
+        return ctLen == ptLen + 16
+    }
+
+    /**
+     * K9:不带 attestation challenge 的 AndroidKeyStore EC keygen,返公钥 SHA-256。
+     * ghost MyKeyPairGenerator 对未设 challenge 的 keygen 返**固定内嵌 keyPair** → 所有设备/安装同一把公钥
+     *   = 跨用户唯一锚(真机应 per-device 唯一 + 跨一键新机必变)。检测器跨设备/跨新机比对此 hash。
+     */
+    fun nonAttestEcPubKeySha256(): String? = runCatching {
+        val alias = "ghost_verify_nonattest_ec"
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        runCatching { ks.deleteEntry(alias) }  // 每次重新生成,避免复用旧 entry
+        val kpg = java.security.KeyPairGenerator.getInstance(
+            KeyProperties.KEY_ALGORITHM_EC, "AndroidKeyStore")
+        kpg.initialize(
+            KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_SIGN)
+                .setDigests(KeyProperties.DIGEST_SHA256)
+                // 故意不调 setAttestationChallenge → 命中 ghost 非认证固定密钥分支
+                .build())
+        val kp = kpg.generateKeyPair()
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(kp.public.encoded).joinToString("") { "%02x".format(it) }
+    }.getOrNull()
+
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
     private fun String.unhex(): ByteArray = chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }
