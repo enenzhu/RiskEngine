@@ -858,6 +858,51 @@ class GhostCollector(private val context: Context) {
             field("phoneType",
                 "TelephonyManager.phoneType" jLayer { tm?.phoneType?.toString() ?: "" },
             )
+            // --- SIM 存在/就绪(TelephonyManagerHook 服务端伪造:
+            //     ISub.getSimStateForSlotIndex→SIM_STATE_READY(5)、
+            //     ITelephony.hasIccCardUsingSlotIndex→true)---
+            field("simState",
+                "TelephonyManager.getSimState" jLayer {
+                    when (val s = tm?.simState) {
+                        null -> ""
+                        TelephonyManager.SIM_STATE_ABSENT -> "ABSENT"
+                        TelephonyManager.SIM_STATE_READY -> "READY"
+                        TelephonyManager.SIM_STATE_PIN_REQUIRED -> "PIN_REQUIRED"
+                        TelephonyManager.SIM_STATE_PUK_REQUIRED -> "PUK_REQUIRED"
+                        TelephonyManager.SIM_STATE_NETWORK_LOCKED -> "NETWORK_LOCKED"
+                        TelephonyManager.SIM_STATE_NOT_READY -> "NOT_READY"
+                        TelephonyManager.SIM_STATE_PERM_DISABLED -> "PERM_DISABLED"
+                        TelephonyManager.SIM_STATE_CARD_IO_ERROR -> "CARD_IO_ERROR"
+                        TelephonyManager.SIM_STATE_CARD_RESTRICTED -> "CARD_RESTRICTED"
+                        else -> s.toString()
+                    }
+                },
+            )
+            field("hasIccCard",
+                "TelephonyManager.hasIccCard" jLayer { tm?.hasIccCard()?.toString() ?: "" },
+            )
+            // getNetworkCountryIso → ITelephony.getNetworkCountryIsoForPhone 被伪造成 props.simCountryIso。
+            // native gsm.operator.iso-country 未被 ghost 伪造 → 有真 SIM 时 java(spoof) vs native(真)
+            // 会在本 field 内自动查出不一致(强泄漏信号)。
+            field("networkCountryIso",
+                "TelephonyManager.networkCountryIso" jLayer { tm?.networkCountryIso ?: "" },
+                "gsm.operator.iso-country" nLayer { NativeBridge.getSystemProperty("gsm.operator.iso-country") },
+            )
+            // getSimCarrierId → ITelephony.getSubscriptionCarrierId 被伪造成 extraData[CarrierId](默认 1)
+            field("simCarrierId",
+                "TelephonyManager.getSimCarrierId" jLayer {
+                    val id = tm?.simCarrierId ?: TelephonyManager.UNKNOWN_CARRIER_ID
+                    if (id == TelephonyManager.UNKNOWN_CARRIER_ID) "" else id.toString()
+                },
+            )
+            field("simCarrierIdName",
+                "TelephonyManager.getSimCarrierIdName" jLayer { tm?.simCarrierIdName?.toString() ?: "" },
+            )
+            // getLine1Number → IPhoneSubInfo.getLine1Number 兜底重写(仅原值非空/系统应用才改)。
+            // 普通检测器无 READ_PHONE_NUMBERS → safeCollect 捕获 SecurityException,值为空,不参与规则。
+            field("line1Number",
+                "TelephonyManager.getLine1Number" jLayer { tm?.line1Number ?: "" },
+            )
         }
 
         // ============================================================
@@ -1157,7 +1202,96 @@ class GhostCollector(private val context: Context) {
                 field("tee.id.serial",
                     "TEE hw-enforced attestationIdSerial[713]" jLayer { tee.idSerial },
                 )
+                // ★K1:cert chain 验签 + leaf 有效期跨度(伪 leaf 对不上 Google 中间证书=false;有效期 ~1h ≪ 真机数千h)
+                field("tee.chain_verified",
+                    "leaf→…→root 逐级 verify(parent.pub)" jLayer { tee.chainVerified },
+                )
+                field("tee.leaf_validity_hours",
+                    "leaf notAfter-notBefore(小时;真机 ≫1000,伪 leaf ~1)" jLayer { tee.leafValidityHours?.toString() },
+                )
+                field("tee.root_pubkey_sha256",
+                    "chain root 公钥 SHA256(vs Google hw-attestation root allowlist)" jLayer { tee.rootPubKeySha256 },
+                )
+                // ★K3:osVersion[705] / osPatchLevel[706] vs Build(硬编码 A13/2024-01 与 spoof 到 A14/15/16 直接矛盾)
+                field("att.os_version vs Build.RELEASE",
+                    "Build.VERSION.RELEASE(major)" jLayer { Build.VERSION.RELEASE?.substringBefore('.') },
+                    "attestation osVersion[705] major" jLayer { tee.osVersion?.let { (it / 10000).toString() } },
+                )
+                field("att.os_patch_level vs SECURITY_PATCH",
+                    "Build.VERSION.SECURITY_PATCH(YYYY-MM)" jLayer { Build.VERSION.SECURITY_PATCH?.take(7) },
+                    "attestation osPatchLevel[706](YYYY-MM)" jLayer {
+                        tee.osPatchLevel?.let { "%04d-%02d".format(it / 100, it % 100) }
+                    },
+                )
+                // ★K2:RootOfTrust[704] verifiedBootState/deviceLocked vs ro.boot.*(root unlock→attestation orange/false 硬拆 sysprop green/1)
+                field("att.verified_boot_state vs ro.boot.verifiedbootstate",
+                    "attestation verifiedBootState[704]" jLayer {
+                        tee.verifiedBootState?.let { when (it) { 0 -> "green"; 1 -> "yellow"; 2 -> "orange"; 3 -> "red"; else -> "unknown($it)" } }
+                    },
+                    "ro.boot.verifiedbootstate" nLayer { NativeBridge.getSystemProperty("ro.boot.verifiedbootstate") },
+                    "getprop ro.boot.verifiedbootstate" sLayer { getpropShell("ro.boot.verifiedbootstate") },
+                )
+                field("att.device_locked vs ro.boot.flash.locked",
+                    "attestation deviceLocked[704]" jLayer { tee.deviceLocked?.let { if (it) "1" else "0" } },
+                    "ro.boot.flash.locked" nLayer { NativeBridge.getSystemProperty("ro.boot.flash.locked") },
+                )
+                // verifiedBootKey/Hash:随机/跨采集变=锚(真机命中已知 Google/OEM 摘要 + 稳定)
+                field("att.verified_boot_key",
+                    "RootOfTrust verifiedBootKey(hex)" jLayer { tee.verifiedBootKeyHex },
+                )
+                field("att.verified_boot_hash",
+                    "RootOfTrust verifiedBootHash(hex)" jLayer { tee.verifiedBootHashHex },
+                )
+                // ★K4:KeyInfo.getSecurityLevel vs attestation_security_level(ghost 内部矛盾:KeyInfo 报 StrongBox 但 attestation 报 TEE=穿帮)
+                field("keyinfo.security_level vs attestation_level",
+                    "KeyInfo.getSecurityLevel" jLayer { tee.keyInfoSecurityLevel },
+                    "attestation_security_level" jLayer { tee.attestationSecurityLevel },
+                )
+                field("keyinfo.inside_secure_hardware",
+                    "KeyInfo.isInsideSecureHardware" jLayer { tee.insideSecureHardware?.toString() },
+                )
             }
+            // ★K5:strongbox/app_attest/device_id_attestation feature(security_level=StrongBox 却 feature=false 自相矛盾;
+            //   Build 冒充旗舰本应有 strongbox 却 false=锚)。放 tee 块外(与 attestation 成败无关,恒采)。
+            field("has_feature.strongbox_keystore",
+                "hasSystemFeature(strongbox_keystore)" jLayer { context.packageManager.hasSystemFeature("android.hardware.strongbox_keystore").toString() },
+            )
+            field("has_feature.app_attest_key",
+                "hasSystemFeature(keystore.app_attest_key)" jLayer { context.packageManager.hasSystemFeature("android.hardware.keystore.app_attest_key").toString() },
+            )
+            field("has_feature.device_id_attestation",
+                "hasSystemFeature(device_id_attestation)" jLayer { context.packageManager.hasSystemFeature("android.software.device_id_attestation").toString() },
+            )
+        }
+
+        // ============================================================
+        // K'. Keystore 加解密跨设备可移植性(farm app 用 AndroidKeyStore 加密 token,备份/还原/新机后能否解开)
+        //    真机:硬件密钥留 TEE、还原后解不开=丢登录态;ghost:常量 seed 软件密钥+固定 IV → 跨设备可解、删 alias 不破。
+        //    跨设备(baseline 密文 vs 当前密钥)由 restore-diff 单测;此处测同会话 + 删 alias-regen。
+        // ============================================================
+        category("keystore-crypto") {
+            val enc = KeystoreCryptoProbe.encrypt(KeystoreCryptoProbe.CANARY)
+            field("crypto.aes_encrypt_ok",
+                "AndroidKeyStore AES/GCM encrypt(canary)" jLayer { (enc != null).toString() },
+            )
+            field("crypto.aes_self_decrypt_ok",
+                "encrypt→decrypt==canary(同会话往返)" jLayer { KeystoreCryptoProbe.selfRoundTripOk().toString() },
+            )
+            // ★删 alias→重生成→解删前密文:ghost 常量 seed→仍成功(true);真机硬件密钥→失败(false)。
+            field("crypto.delete_alias_regen_decrypt_ok",
+                "删 alias 重生成后解旧密文" jLayer { KeystoreCryptoProbe.deleteRegenDecryptOk().toString() },
+            )
+            // 确定性密文:ghost 固定 seed+IV → 同明文同密文(跨设备/跨采集稳定=可移植的间接证据)
+            field("crypto.canary_ciphertext_hex",
+                "AES/GCM(canary) ciphertext(ghost 常量 seed→跨设备稳定)" jLayer { enc?.first },
+            )
+            // ★空加密检测:ghost NoEncryptionCipher 让密文==明文 → 跨设备可移植(✓)但'密文==明文'是检测面。
+            field("crypto.encryption_is_noop",
+                "密文==明文?(true=ghost 空加密:可移植但可被检测)" jLayer {
+                    val plainHex = KeystoreCryptoProbe.CANARY.toByteArray(Charsets.UTF_8).joinToString("") { "%02x".format(it) }
+                    enc?.let { (it.first == plainHex).toString() }
+                },
+            )
         }
 
         // ============================================================
@@ -1228,31 +1362,32 @@ class GhostCollector(private val context: Context) {
             )
             // Accessibility 多路径检测(FB SDK ACCESSIBILITY_ENABLED 走 isEnabled() Java API,
             // ghost SettingsProviderHook 拦不到这条路径 — 验证是否有泄漏)
+            // ★布尔归一化:isEnabled 返回 "true"/"false",Settings/shell 返回 "1"/"0",语义相同但字符串不同
+            //   会被一致性检查误判为不一致。归一到 true/false;null/n/a/空(探针失败)→ null 不参与一致性。
             field("accessibility_is_enabled",
                 "AccessibilityManager.isEnabled()" jLayer {
-                    runCatching {
+                    normBool(runCatching {
                         val mgr = context.getSystemService(Context.ACCESSIBILITY_SERVICE)
                             as android.view.accessibility.AccessibilityManager
                         mgr.isEnabled.toString()
-                    }.getOrNull() ?: "n/a"
+                    }.getOrNull())
                 },
                 "AccessibilityManager.isTouchExplorationEnabled()" jLayer {
-                    runCatching {
+                    normBool(runCatching {
                         val mgr = context.getSystemService(Context.ACCESSIBILITY_SERVICE)
                             as android.view.accessibility.AccessibilityManager
                         mgr.isTouchExplorationEnabled.toString()
-                    }.getOrNull() ?: "n/a"
+                    }.getOrNull())
                 },
                 "Settings.Secure.accessibility_enabled" jLayer {
-                    Settings.Secure.getString(context.contentResolver,
-                        "accessibility_enabled") ?: "null"
+                    normBool(Settings.Secure.getString(context.contentResolver, "accessibility_enabled"))
                 },
                 "popen settings get secure accessibility_enabled" sLayer {
-                    runCatching {
+                    normBool(runCatching {
                         Runtime.getRuntime().exec(
                             arrayOf("sh","-c","settings get secure accessibility_enabled")
                         ).inputStream.bufferedReader().use { it.readText().trim() }
-                    }.getOrNull() ?: "n/a"
+                    }.getOrNull())
                 },
             )
             field("accessibility_enabled_services_count",
@@ -1326,6 +1461,202 @@ class GhostCollector(private val context: Context) {
                         context.packageManager.getPackageInfo(context.packageName, 0)
                     }
                     if (hits.isEmpty()) "clean" else "hit:${hits.joinToString(";").take(150)}"
+                },
+            )
+        }
+
+        // ============================================================
+        // M2. 环境暴露面一致性 — 从真实 app 进程视角验证 Root/Hook/工具链是否仍可见。
+        //     重点看同一类痕迹在 path/stat/cmd/proc/PMS 多条路径下是否同源隐藏。
+        // ============================================================
+        category("env-visibility") {
+            val rootArtifactPaths = listOf(
+                // /data/adb 裸目录 stock 机也存在(实测),File.exists 两边都 true = 非区分信号,不探;
+                //   下面 /data/adb/ksud、modules/* 等才是 root 方案专属 anchor(且对 app blocked 不泄漏)。
+                "/data/adb/ksud",
+                "/data/adb/modules",
+                "/data/adb/modules/abcd",
+                "/data/adb/modules/playintegrityfix",
+                "/data/adb/modules/riru_lsposed",
+                "/data/adb/modules/susfs4ksu",
+                "/data/adb/modules/tricky_store",
+                "/data/adb/modules/zygisksu",
+                "/data/adb/.abcd",
+                "/data/adb/lspd",
+                "/data/adb/tricky_store",
+                "/data/adb/zygisk",
+                "/data/adb/zygisksu",
+                // /data/system/.a 是 ghost 自己的配置目录,用户判定可接受 → 不纳入探测(不误报为 root 足迹)
+            )
+            val suPaths = listOf(
+                "/system/bin/su",
+                "/system/xbin/su",
+                "/sbin/su",
+                "/vendor/bin/su",
+                "/debug_ramdisk/su",
+                "/su/bin/su",
+                "/magisk/.core/bin/su",
+                "/data/adb/ksu/bin/su",
+            )
+            val sensitivePkgs = listOf(
+                "com.tt.hi",
+                "org.auto.auto.v6",
+                "org.autojs.autoxjs.v6",
+                "moe.nb4a",
+                "fun.kitsunebi.kitsunebi4android",
+                "com.reqable.android",
+                "com.sukisu.ultra",
+                "me.weishu.kernelsu",
+                "com.rifsxd.ksunext",
+                "org.lsposed.manager",
+                "org.x.manager",
+                "de.robv.android.xposed.installer",
+            )
+
+            field("env.uid_context",
+                "Process uid/gid + SELinux context + /proc/self/status" jLayer {
+                    val status = NativeBridge.readFile("/proc/self/status", 8192)
+                    val uid = status.lineSequence().firstOrNull { it.startsWith("Uid:") }?.trim().orEmpty()
+                    val gid = status.lineSequence().firstOrNull { it.startsWith("Gid:") }?.trim().orEmpty()
+                    val groups = status.lineSequence().firstOrNull { it.startsWith("Groups:") }?.trim().orEmpty()
+                    val nn = status.lineSequence().firstOrNull { it.startsWith("NoNewPrivs:") }?.trim().orEmpty()
+                    val ctx = NativeBridge.readFile("/proc/self/attr/current", 256)
+                        .replace('\u0000', ' ').trim()
+                    "uid=${android.os.Process.myUid()} appUid=${context.applicationInfo.uid} ctx=$ctx $uid $gid $groups $nn"
+                },
+            )
+
+            field("env.su_paths",
+                "java/stat/svc/shell path probe over common su locations" jLayer {
+                    summarizePathProbes(suPaths)
+                },
+            )
+            field("env.su_command_path",
+                "command -v/type/which su" nLayer {
+                    val raw = NativeBridge.execShell(
+                        "command -v su 2>/dev/null; type su 2>/dev/null; which su 2>/dev/null",
+                        1024
+                    ).trim()
+                    // ★mksh 的 `type su` 找不到时会把 "su not found" 打到 stdout(不是 stderr,躲不掉 2>/dev/null),
+                    //   过滤掉这类"没找到"行;剩下只有含真实路径('/')才算真找到 su。否则=clean。
+                    val hits = raw.lines().map { it.trim() }
+                        .filter { it.isNotEmpty() && it.contains("/") && !it.contains("not found", ignoreCase = true) }
+                    if (hits.isEmpty()) "clean" else hits.joinToString("; ")
+                },
+            )
+            field("env.root_artifact_paths",
+                "java/stat/svc/shell path probe over /data/adb and module locations" jLayer {
+                    summarizePathProbes(rootArtifactPaths)
+                },
+            )
+            field("env.data_adb_listing",
+                "ls -la /data/adb* as app uid" nLayer {
+                    val out = NativeBridge.execShell(
+                        "ls -ld /data/adb /data/adb/modules /data/adb/.abcd 2>&1",
+                        2048
+                    ).trim()
+                    normalizeProbeOutput(out)
+                },
+            )
+
+            field("env.proc_maps_keywords",
+                "/proc/self/maps keyword scan" pLayer {
+                    summarizeKeywordLines(NativeBridge.readFile("/proc/self/maps", 65536))
+                },
+            )
+            field("env.proc_smaps_keywords",
+                "/proc/self/smaps keyword scan" pLayer {
+                    summarizeKeywordLines(NativeBridge.readFile("/proc/self/smaps", 65536))
+                },
+            )
+            field("env.proc_mountinfo_keywords",
+                "/proc/self/mountinfo keyword scan" pLayer {
+                    summarizeKeywordLines(NativeBridge.readFile("/proc/self/mountinfo", 65536))
+                },
+            )
+            field("env.proc_fd_keywords",
+                "/proc/self/fd readlink keyword scan" jLayer {
+                    summarizeKeywordLines(readProcSelfFdLinks().joinToString("\n"))
+                },
+            )
+            field("env.proc_cmdline_status",
+                "/proc/self/cmdline + selected status lines" pLayer {
+                    val cmd = NativeBridge.readFile("/proc/self/cmdline", 512)
+                        .replace('\u0000', ' ').trim()
+                    val status = NativeBridge.readFile("/proc/self/status", 8192)
+                    val selected = status.lineSequence()
+                        .filter { line ->
+                            line.startsWith("Name:") || line.startsWith("TracerPid:") ||
+                                line.startsWith("Uid:") || line.startsWith("Gid:") ||
+                                line.startsWith("Groups:") || line.startsWith("Seccomp:") ||
+                                line.startsWith("NoNewPrivs:")
+                        }
+                        .joinToString(" ")
+                    "cmdline=${cmd.ifEmpty { "<empty>" }} $selected"
+                },
+            )
+            field("env.proc_other_process_keywords",
+                "scan readable /proc/*/cmdline for tool/root keywords" nLayer {
+                    val out = NativeBridge.execShell(
+                        "for p in /proc/[0-9]*; do c=$(cat \"\$p/cmdline\" 2>/dev/null | tr '\\000' ' '); [ -n \"\$c\" ] && echo \"\$p \$c\"; done",
+                        32768
+                    )
+                    summarizeKeywordLines(out)
+                },
+            )
+
+            field("env.cmd_service_list",
+                "popen service list keyword scan" nLayer {
+                    val out = NativeBridge.execShell("service list 2>&1", 16384)
+                    val summary = summarizeKeywordLines(out, SERVICE_KEYWORDS)
+                    if (summary == "clean" && out.trim().isEmpty()) "clean(empty)"
+                    else summary
+                },
+            )
+            field("env.cmd_package_list_sensitive",
+                "popen pm/cmd package list packages keyword scan" nLayer {
+                    val out = NativeBridge.execShell(
+                        "(pm list packages 2>/dev/null; cmd package list packages 2>/dev/null) | sort -u",
+                        32768
+                    )
+                    summarizeKeywordLines(out)
+                },
+            )
+            field("env.getprop_root_keywords",
+                "popen getprop keyword scan" nLayer {
+                    summarizeKeywordLines(NativeBridge.execShell("getprop 2>/dev/null", 32768))
+                },
+            )
+            field("env.settings_tooling_keys",
+                "settings values that often expose accessibility/VPN/dev tooling" nLayer {
+                    val keys = listOf(
+                        "settings get secure enabled_accessibility_services",
+                        "settings get secure accessibility_button_targets",
+                        "settings get secure accessibility_shortcut_target_service",
+                        "settings get secure default_input_method",
+                        "settings get global always_on_vpn_app",
+                        "settings get global lockdown_vpn",
+                        "settings get global development_settings_enabled",
+                        "settings get global adb_enabled",
+                    )
+                    val out = keys.joinToString("\n") { cmd ->
+                        val v = NativeBridge.execShell("$cmd 2>/dev/null", 1024).trim()
+                        "$cmd => ${v.ifEmpty { "<empty>" }}"
+                    }
+                    summarizeKeywordLines(out).takeIf { it != "clean" } ?: out.take(800)
+                },
+            )
+            field("env.pms_direct_sensitive_pkgs",
+                "direct PackageManager.getPackageInfo over tool/root packages" jLayer {
+                    val hits = sensitivePkgs.mapNotNull { pkg ->
+                        runCatching {
+                            val pi = context.packageManager.getPackageInfo(pkg, 0)
+                            val appInfo = pi.applicationInfo
+                            val src = appInfo?.sourceDir ?: ""
+                            "$pkg uid=${appInfo?.uid ?: -1} src=${src.takeLast(80)}"
+                        }.getOrNull()
+                    }
+                    if (hits.isEmpty()) "clean" else "${hits.size} visible: ${hits.joinToString(" | ").take(900)}"
                 },
             )
         }
@@ -1672,13 +2003,562 @@ class GhostCollector(private val context: Context) {
             // ★ 关键派生:active DNS 跟 WiFi DHCP DNS 不一致 = VPN/proxy 隧道改了 DNS
             //   商业风控强信号(独立于 NET_CAPABILITY_NOT_VPN 检测,绕得过 VPN 检测的代理这里也漏)
             field("network.dns.via_vpn_or_proxy",
-                "active_dns != wifi_dhcp_dns" jLayer {
+                "active_dns ⊄ wifi_dhcp_dns" jLayer {
                     val a = activeDns(); val w = dhcpDns()
                     when {
                         a.isEmpty() || w.isEmpty() -> "unknown (a=$a, w=$w)"
-                        a == w -> "false"
-                        else -> "true (active=$a, dhcp=$w)"
+                        else -> {
+                            // ★集合差,不是字符串精确相等:active DNS 里出现了 DHCP 没下发的地址 = 隧道改了 DNS。
+                            //   active ⊆ dhcp(active 就是网关那台、dhcp 只是多列了几台)= 正常网关,不算 VPN/代理。
+                            val aSet = a.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+                            val wSet = w.split(",").map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+                            val extra = aSet - wSet
+                            if (extra.isEmpty()) "false"
+                            else "true (active_only=${extra.joinToString(",")}, active=$a, dhcp=$w)"
+                        }
                     }
+                },
+            )
+        }
+
+        // ============================================================
+        // network 组:NetworkInterface 真洞 + WifiInfo/DHCP IP 链 + hasTransport
+        //   ghost NetworkInterfaceHook 只 hook java.net.NetworkInterface.getAll()
+        //   (client 端 in-process),保留 lo+wlan/rmnet、把 addrs 全改 cellIp、删 tun0/ppp;
+        //   但不动 getHardwareAddress。采集器直接走 getNetworkInterfaces()(无权限、
+        //   绕过 Wifi/Connectivity server hook)看 ghost 呈现:hook 生效=只剩 {lo, wlan/rmnet}
+        //   + data IP=cellIp + 无 tun/ppp;失效/泄漏=多网卡 / 隧道网卡 / 真 MAC / IP 不匹配。
+        // ============================================================
+        category("network-ifaces") {
+            // 单次调用 + 捕获诊断:区分 NULL(getAll 空→AOSP 返 null) vs THREW(hook body 崩,哪个异常) vs ok
+            var ifaceErr = "ok"
+            val ifaces: List<java.net.NetworkInterface> = try {
+                val e = java.net.NetworkInterface.getNetworkInterfaces()
+                if (e == null) { ifaceErr = "NULL (getAll 返空数组/null → AOSP getNetworkInterfaces 返 null)"; emptyList() }
+                else e.toList()
+            } catch (t: Throwable) {
+                ifaceErr = "THREW ${t.javaClass.name}: ${t.message} | cause=${t.cause?.javaClass?.name}:${t.cause?.message}"
+                emptyList()
+            }
+            field("network.iface_error", "getNetworkInterfaces() null/异常诊断" jLayer { ifaceErr })
+
+            fun isLoopback(n: String) = n == "lo"
+            fun isVpnIface(n: String): Boolean {
+                val l = n.lowercase()
+                return l.startsWith("tun") || l.startsWith("ppp") || l.startsWith("ipsec") ||
+                    l.startsWith("pptp") || l.startsWith("wg") || l.startsWith("tap") ||
+                    l.startsWith("nordlynx") || l.startsWith("proton")
+            }
+            // 真机常驻的伪/隧道网卡(不算"额外物理数据网卡")
+            fun isVirtual(n: String): Boolean {
+                val l = n.lowercase()
+                return l.startsWith("dummy") || l.startsWith("sit") || l.startsWith("ip6tnl") ||
+                    l.startsWith("ip6_vti") || l.startsWith("ip_vti") || l.startsWith("gre") ||
+                    l.startsWith("rmnet_ipa") || l.startsWith("bond") || l.startsWith("ifb") ||
+                    l.startsWith("stf") || l.startsWith("ap0")
+            }
+            fun isDataIface(n: String): Boolean {
+                val l = n.lowercase()
+                return l.startsWith("wlan") || l.startsWith("rmnet_data") ||
+                    l.startsWith("eth") || l.startsWith("ccmni") || l.startsWith("v4-rmnet")
+            }
+            fun firstIpv4(ni: java.net.NetworkInterface): String? =
+                ni.inetAddresses.toList()
+                    .firstOrNull { it is java.net.Inet4Address && !it.isLoopbackAddress }
+                    ?.hostAddress
+            fun hwaddrHex(ni: java.net.NetworkInterface): String? = runCatching {
+                ni.hardwareAddress?.joinToString(":") { "%02x".format(it.toInt() and 0xff) }
+            }.getOrNull()
+
+            field("network.iface_names",
+                "NetworkInterface.getNetworkInterfaces() names(sorted)" jLayer {
+                    if (ifaces.isEmpty()) "<none>"
+                    else ifaces.map { it.name }.sorted().joinToString(",")
+                },
+            )
+            field("network.iface_dump",
+                "per-iface name|up|lo|ipv4s|hwaddr" jLayer {
+                    if (ifaces.isEmpty()) "<none>"
+                    else ifaces.joinToString(" ; ") { ni ->
+                        val up = runCatching { ni.isUp }.getOrNull()
+                        val lo = runCatching { ni.isLoopback }.getOrNull()
+                        val v4 = ni.inetAddresses.toList()
+                            .filterIsInstance<java.net.Inet4Address>()
+                            .joinToString(",") { it.hostAddress ?: "?" }
+                        val hw = hwaddrHex(ni) ?: "<null>"
+                        "${ni.name}|up=$up|lo=$lo|v4=[$v4]|hw=$hw"
+                    }.take(1200)
+                },
+            )
+            // primary data iface(wlan/rmnet)IPv4 — 应 == WifiInfo.ip == DhcpInfo.ip == cellIp
+            field("network.iface_data_ipv4",
+                "first IPv4 of wlan*/rmnet_data*/eth* iface" jLayer {
+                    ifaces.filter { isDataIface(it.name) }.firstNotNullOfOrNull { firstIpv4(it) } ?: "<none>"
+                },
+            )
+            // tun0/ppp 存在 = VPN 泄漏(绕过 Connectivity NOT_VPN + transport 双 spoof)
+            field("network.iface_vpn_present",
+                "any tun*/ppp*/ipsec*/wg* interface present" jLayer {
+                    val v = ifaces.filter { isVpnIface(it.name) }.map { it.name }
+                    if (v.isEmpty()) "false" else "true (${v.joinToString(",")})"
+                },
+            )
+            // getHardwareAddress 泄漏真 MAC(hook 不改 hwaddr;Android 11+ 通常 redact→null,
+            //   非 null 且非 02:00:00:00:00:00 / 全 0 = 真 MAC 泄漏)
+            field("network.iface_hwaddr_leak",
+                "non-lo iface hardwareAddress != redacted" jLayer {
+                    val leaks = ifaces.filter { !isLoopback(it.name) }.mapNotNull { ni ->
+                        val hw = hwaddrHex(ni) ?: return@mapNotNull null
+                        val norm = hw.lowercase()
+                        if (norm == "02:00:00:00:00:00" || norm == "00:00:00:00:00:00") null
+                        else "${ni.name}=$hw"
+                    }
+                    if (leaks.isEmpty()) "false" else "true (${leaks.joinToString(",")})"
+                },
+            )
+            // 带 IPv4 的非虚拟数据网卡数(hook 后应恰好 1:wlan 或 rmnet;>1=hook 未收敛/泄漏)
+            field("network.iface_data_count",
+                "count of non-lo/non-virtual ifaces with IPv4" jLayer {
+                    ifaces.count { ni ->
+                        !isLoopback(ni.name) && !isVirtual(ni.name) && !isVpnIface(ni.name) &&
+                            firstIpv4(ni) != null
+                    }.toString()
+                },
+            )
+
+            // ── WifiInfo.ipAddress / DhcpInfo(server hook 面,应与 iface IP 同 = cellIp)──
+            @Suppress("DEPRECATION")
+            val wifiMgr = runCatching {
+                context.applicationContext.getSystemService(android.content.Context.WIFI_SERVICE)
+                    as? android.net.wifi.WifiManager
+            }.getOrNull()
+            fun ipStr(i: Int): String = if (i == 0) "0.0.0.0"
+                else "${i and 0xff}.${(i shr 8) and 0xff}.${(i shr 16) and 0xff}.${(i shr 24) and 0xff}"
+            field("wifi.info_ipaddress",
+                "WifiManager.connectionInfo.ipAddress" jLayer {
+                    @Suppress("DEPRECATION")
+                    runCatching { ipStr(wifiMgr?.connectionInfo?.ipAddress ?: 0) }
+                        .getOrElse { "<denied> ${it.javaClass.simpleName}" }
+                },
+            )
+            @Suppress("DEPRECATION")
+            val dhcp = runCatching { wifiMgr?.dhcpInfo }.getOrNull()
+            field("wifi.dhcp_ipaddress",
+                "WifiManager.dhcpInfo.ipAddress" jLayer { dhcp?.let { ipStr(it.ipAddress) } ?: "<null>" },
+            )
+            field("wifi.dhcp_gateway",
+                "WifiManager.dhcpInfo.gateway" jLayer { dhcp?.let { ipStr(it.gateway) } ?: "<null>" },
+            )
+            field("wifi.dhcp_server",
+                "WifiManager.dhcpInfo.serverAddress" jLayer { dhcp?.let { ipStr(it.serverAddress) } ?: "<null>" },
+            )
+            field("wifi.dhcp_netmask",
+                "WifiManager.dhcpInfo.netmask" jLayer { dhcp?.let { ipStr(it.netmask) } ?: "<null>" },
+            )
+
+            // ── ConnectivityManager hasTransport(WIFI/CELLULAR/VPN)──
+            val cm = runCatching {
+                context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                    as? android.net.ConnectivityManager
+            }.getOrNull()
+            fun activeCaps(): android.net.NetworkCapabilities? = runCatching {
+                val active = cm?.activeNetwork ?: return null
+                cm.getNetworkCapabilities(active)
+            }.getOrNull()
+            field("network.transport_wifi",
+                "activeNetwork caps.hasTransport(TRANSPORT_WIFI)" jLayer {
+                    activeCaps()?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI)?.toString() ?: "<null>"
+                },
+            )
+            field("network.transport_cellular",
+                "activeNetwork caps.hasTransport(TRANSPORT_CELLULAR)" jLayer {
+                    activeCaps()?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR)?.toString() ?: "<null>"
+                },
+            )
+            // 第二 VPN 信号(独立于 network.vpn_active 的 NOT_VPN capability 检测)
+            field("network.transport_vpn",
+                "activeNetwork caps.hasTransport(TRANSPORT_VPN)" jLayer {
+                    activeCaps()?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN)?.toString() ?: "<null>"
+                },
+            )
+        }
+
+        // ============================================================
+        // I-2b. Sensor 元数据自洽 (group "sensor")
+        //   ghost SensorManagerHook.changeSensor 只改 mName/mVendor/mMaxRange/
+        //   mResolution 四个字段(见 hook),留真 version/power/minDelay。
+        //   伪造 maxRange/resolution = Random.float(maxValue,dp) 均匀随机 [0,maxValue),
+        //   常越出真机标准量程/分辨率,且两字段独立随机可倒挂;
+        //   name 若走 stringUpper(5) 则是 QFRJU 类裸大写字母乱码。
+        //   本 category 采齐 name/maxRange/resolution/version/power/minDelay
+        //   供 CrossFieldChecker 做物理自洽 + 乱码判定(SensorManager 无需权限)。
+        // ============================================================
+        category("sensor-metadata") {
+            val sm = context.getSystemService(Context.SENSOR_SERVICE) as? android.hardware.SensorManager
+
+            // 裸大写字母块判定:trim 后纯大写字母、无空格、无数字、长 4-10。
+            // 真机 sensor name 必带空格(" Accelerometer")或数字(芯片型号 BMI260/AK09918)
+            // 或混合大小写;裸大写字母块 = ghost stringUpper() 签名(QFRJU)。
+            fun isGarbageName(n: String?): Boolean {
+                val s = n?.trim() ?: return false
+                return Regex("^[A-Z]{4,10}$").matches(s)
+            }
+
+            // 逐传感器采全元组:accelerometer / gyroscope / magnetic
+            val keySensors = listOf(
+                "accelerometer" to android.hardware.Sensor.TYPE_ACCELEROMETER,
+                "gyroscope"     to android.hardware.Sensor.TYPE_GYROSCOPE,
+                "magnetic"      to android.hardware.Sensor.TYPE_MAGNETIC_FIELD,
+            )
+            for ((label, type) in keySensors) {
+                val s = sm?.getDefaultSensor(type)
+                field("sensor.$label.name",
+                    "Sensor($label).getName" jLayer { s?.name ?: "" })
+                field("sensor.$label.maxRange",
+                    "Sensor($label).getMaximumRange" jLayer { s?.maximumRange?.toString() ?: "" })
+                field("sensor.$label.resolution",
+                    "Sensor($label).getResolution" jLayer { s?.resolution?.toString() ?: "" })
+                // version/power/minDelay: ghost 不改(留真硬件值),采下来供分析 + 未来参考库比对
+                field("sensor.$label.version",
+                    "Sensor($label).getVersion" jLayer { s?.version?.toString() ?: "" })
+                field("sensor.$label.power",
+                    "Sensor($label).getPower" jLayer { s?.power?.toString() ?: "" })
+                field("sensor.$label.minDelay",
+                    "Sensor($label).getMinDelay" jLayer { s?.minDelay?.toString() ?: "" })
+            }
+
+            // 全量 name 乱码扫描 — 覆盖未单列的传感器
+            val allSensors = sm?.getSensorList(android.hardware.Sensor.TYPE_ALL).orEmpty()
+            field("sensor.name_garbage_scan",
+                "扫描全部 Sensor.name 找 stringUpper 乱码(裸大写字母块)" jLayer {
+                    val bad = allSensors.map { it.name }.filter { isGarbageName(it) }.distinct()
+                    if (bad.isEmpty()) "clean(${allSensors.size} sensors)"
+                    else "SUSPICIOUS ${bad.size}: ${bad.take(8).joinToString(",")}"
+                })
+
+            // 全量 resolution>=maxRange(物理不可能:分辨率是最小刻度)扫描 —
+            // ghost 两字段独立随机可倒挂
+            // 严格 r > m:触发/一次性传感器(Significant Motion/Step Detector 等)天生
+            // maxRange==resolution==1.0(不是连续量程),必须用严格大于排除,否则误报。
+            field("sensor.range_resolution_scan",
+                "扫描 resolution>maxRange 的传感器(物理不可能;排除 res==range 的触发型)" jLayer {
+                    val bad = allSensors.filter {
+                        val r = it.resolution; val m = it.maximumRange
+                        r > 0f && m > 0f && r > m
+                    }.map { "${it.name}(res=${it.resolution}>range=${it.maximumRange})" }
+                    if (bad.isEmpty()) "clean" else "IMPOSSIBLE ${bad.size}: ${bad.take(6).joinToString(",")}"
+                })
+        }
+
+        // ============================================================
+        // display_gpu — 屏幕分辨率补链 + GPU 家族/驱动一致性(补覆盖缺口组)
+        //   1) mode/supportedModes/stableDisplaySize/realSize 干净 WxH → 喂 RESOLUTION_ALL_EQUAL
+        //      (原 display_get_mode_physical/display_get_supported_modes 带 @refreshRate 的 "120.0" 会被
+        //       checkAllEqualNormalized 的 \d+ 提取出 0/60/120 污染成非分辨率数字→静默丢弃,故另采干净 WxH)
+        //   2) DisplayManagerGlobal.getDisplayInfo:logical(被 wm size 改=spoof) vs physical(真面板,ghost 未 hook)
+        //   3) GLES:GLSL(0x8B8C 落真驱动)+ 实 EGL context 串,供 GPU_FAMILY / RENDERER_VS_EGL / GLSL 规则用
+        // ============================================================
+        category("display_gpu") {
+            // ---- 实 EGL14 pbuffer context 取 GL 串 ----
+            // ghost GLESHook 只 spoof GL_VENDOR/RENDERER/VERSION/EXTENSIONS,未 hook 0x8B8C(GLSL)→落真驱动。
+            // Java GLES10.glGetString 无 GL context 返 null(现有 GL_SHADING_LANGUAGE_VERSION 字段就是 null),
+            // 这里自建 pbuffer context 让 glGetString 真返值(纯 framework EGL14,不引依赖)。
+            val glCtx: Map<Int, String?> = run {
+                val out = HashMap<Int, String?>()
+                var dpy = android.opengl.EGL14.EGL_NO_DISPLAY
+                var ctx = android.opengl.EGL14.EGL_NO_CONTEXT
+                var sfc = android.opengl.EGL14.EGL_NO_SURFACE
+                runCatching {
+                    dpy = android.opengl.EGL14.eglGetDisplay(android.opengl.EGL14.EGL_DEFAULT_DISPLAY)
+                    val ver = IntArray(2)
+                    if (android.opengl.EGL14.eglInitialize(dpy, ver, 0, ver, 1)) {
+                        val cfgAttr = intArrayOf(
+                            android.opengl.EGL14.EGL_RENDERABLE_TYPE, android.opengl.EGL14.EGL_OPENGL_ES2_BIT,
+                            android.opengl.EGL14.EGL_SURFACE_TYPE, android.opengl.EGL14.EGL_PBUFFER_BIT,
+                            android.opengl.EGL14.EGL_RED_SIZE, 8,
+                            android.opengl.EGL14.EGL_GREEN_SIZE, 8,
+                            android.opengl.EGL14.EGL_BLUE_SIZE, 8,
+                            android.opengl.EGL14.EGL_NONE
+                        )
+                        val cfgs = arrayOfNulls<android.opengl.EGLConfig>(1)
+                        val nc = IntArray(1)
+                        if (android.opengl.EGL14.eglChooseConfig(dpy, cfgAttr, 0, cfgs, 0, 1, nc, 0) && nc[0] > 0) {
+                            val ctxAttr = intArrayOf(android.opengl.EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, android.opengl.EGL14.EGL_NONE)
+                            ctx = android.opengl.EGL14.eglCreateContext(dpy, cfgs[0], android.opengl.EGL14.EGL_NO_CONTEXT, ctxAttr, 0)
+                            val pbAttr = intArrayOf(android.opengl.EGL14.EGL_WIDTH, 1, android.opengl.EGL14.EGL_HEIGHT, 1, android.opengl.EGL14.EGL_NONE)
+                            sfc = android.opengl.EGL14.eglCreatePbufferSurface(dpy, cfgs[0], pbAttr, 0)
+                            if (android.opengl.EGL14.eglMakeCurrent(dpy, sfc, sfc, ctx)) {
+                                for (k in intArrayOf(GLES10.GL_VENDOR, GLES10.GL_RENDERER, GLES10.GL_VERSION, 0x8B8C)) {
+                                    out[k] = runCatching { GLES10.glGetString(k) }.getOrNull()
+                                }
+                            }
+                        }
+                    }
+                }
+                // teardown(务必解绑,避免影响宿主线程)
+                runCatching {
+                    if (dpy != android.opengl.EGL14.EGL_NO_DISPLAY) {
+                        android.opengl.EGL14.eglMakeCurrent(dpy, android.opengl.EGL14.EGL_NO_SURFACE,
+                            android.opengl.EGL14.EGL_NO_SURFACE, android.opengl.EGL14.EGL_NO_CONTEXT)
+                        if (sfc != android.opengl.EGL14.EGL_NO_SURFACE) android.opengl.EGL14.eglDestroySurface(dpy, sfc)
+                        if (ctx != android.opengl.EGL14.EGL_NO_CONTEXT) android.opengl.EGL14.eglDestroyContext(dpy, ctx)
+                        android.opengl.EGL14.eglTerminate(dpy)
+                    }
+                }
+                out
+            }
+
+            // ---- DisplayManagerGlobal.getDisplayInfo(0):hidden API,ghost DisplayHook 未 hook 它 ----
+            val diObj: Any? = runCatching {
+                val cls = Class.forName("android.hardware.display.DisplayManagerGlobal")
+                val inst = cls.getMethod("getInstance").invoke(null)
+                cls.getMethod("getDisplayInfo", Int::class.javaPrimitiveType).invoke(inst, 0)
+            }.getOrNull()
+
+            // ---------- 分辨率补链(干净 WxH,喂 RESOLUTION_ALL_EQUAL)----------
+            // Display.getMode() — ghost 改 mWidth/mHeight → spoof(去掉 refreshRate 噪声只留 WxH)
+            field("display_gpu.mode_physical_size",
+                "Display.getMode().physicalWidth x physicalHeight" jLayer {
+                    @Suppress("DEPRECATION")
+                    val m = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.mode
+                    "${m.physicalWidth}x${m.physicalHeight}"
+                },
+            )
+            // Display.getSupportedModes() — 取物理面积最大 mode 的 WxH(真机各 mode 物理分辨率相同)
+            field("display_gpu.supported_modes_size",
+                "Display.getSupportedModes() 最大 physical WxH" jLayer {
+                    @Suppress("DEPRECATION")
+                    val modes = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.supportedModes
+                    modes.maxByOrNull { it.physicalWidth.toLong() * it.physicalHeight }
+                        ?.let { "${it.physicalWidth}x${it.physicalHeight}" }
+                },
+            )
+            // DisplayManager.getStableDisplaySize — GMS 主路径(ghost hook)
+            field("display_gpu.stable_display_size",
+                "DisplayManager.getStableDisplaySize" jLayer {
+                    runCatching {
+                        val dmgr = context.getSystemService(Context.DISPLAY_SERVICE)
+                        val pt = dmgr.javaClass.getMethod("getStableDisplaySize").invoke(dmgr) as android.graphics.Point
+                        "${pt.x}x${pt.y}"
+                    }.getOrNull()
+                },
+            )
+            // Display.getRealSize — 未直 hook,但 wm size 改 logical → 应=spoof
+            field("display_gpu.real_size",
+                "Display.getRealSize" jLayer {
+                    val pt = android.graphics.Point()
+                    @Suppress("DEPRECATION")
+                    (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealSize(pt)
+                    "${pt.x}x${pt.y}"
+                },
+            )
+
+            // ---------- DisplayManagerGlobal.getDisplayInfo logical vs physical ----------
+            // logical:setForcedDisplaySize 改的就是它 → spoof;physical:走 DisplayInfo.getMode() 真面板(ghost 未 hook)
+            field("display_gpu.dmg_logical_size",
+                "DisplayInfo.logicalWidth x logicalHeight (wm size 改 → spoof)" jLayer {
+                    diObj?.let { info ->
+                        val ic = info.javaClass
+                        fun fi(n: String) = runCatching {
+                            ic.getDeclaredField(n).apply { isAccessible = true }.getInt(info)
+                        }.getOrDefault(-1)
+                        val w = fi("logicalWidth"); val h = fi("logicalHeight")
+                        if (w > 0 && h > 0) "${w}x${h}" else null
+                    }
+                },
+            )
+            field("display_gpu.dmg_physical_size",
+                "DisplayInfo.getMode().physicalWidth x physicalHeight (真物理,ghost 未 hook getDisplayInfo)" jLayer {
+                    diObj?.let { info ->
+                        runCatching {
+                            val mode = info.javaClass.getMethod("getMode").invoke(info)
+                            val pw = mode.javaClass.getMethod("getPhysicalWidth").invoke(mode) as Int
+                            val ph = mode.javaClass.getMethod("getPhysicalHeight").invoke(mode) as Int
+                            if (pw > 0 && ph > 0) "${pw}x${ph}" else null
+                        }.getOrNull()
+                    }
+                },
+            )
+
+            // ---------- GLES:GLSL(0x8B8C 落真驱动)+ 实上下文串 ----------
+            field("display_gpu.gl_shading_language_version",
+                "EGL14 ctx + GLES10.glGetString(GL_SHADING_LANGUAGE_VERSION=0x8B8C)" jLayer { glCtx[0x8B8C] },
+            )
+            // 实上下文 vendor/renderer/version(单源信息项,便于人工核对 GLSL/family 规则)
+            field("display_gpu.gl_strings_ctx",
+                "EGL14 ctx vendor|renderer|version" jLayer {
+                    "vendor=${glCtx[GLES10.GL_VENDOR]} | renderer=${glCtx[GLES10.GL_RENDERER]} | version=${glCtx[GLES10.GL_VERSION]}"
+                },
+            )
+        }
+
+        // ============================================================
+        // installsource — ComputerEngine 安装来源核验面(PI 安装来源核心)
+        //   对照 ghost:ComputerEngineHook.hook_getInstallSourceInfo /
+        //   hook_getInstallerPackageName —— 对被 farm 的 caller 把本 app 的
+        //   InstallSourceInfo.initiating/installingPackageName 改成 com.android.vending,
+        //   initiatingPackageSigningInfo 塞【真 vending】SigningInfo;legacy
+        //   getInstallerPackageName 同样返 com.android.vending。
+        //   采集本 app(context.packageName)的完整 installer 链,靠双源 field 自动
+        //   查:(a)三条读路径是否都被改成 Play(某路径漏 hook = divergence);
+        //   (b)伪造的 initiating 签名是否== 真 vending 签名(ghost 若 getVendingSigningInfo
+        //   失败/塞错 = cert 对不上)。
+        // ============================================================
+        category("installsource") {
+            val self = context.packageName
+            val pm = context.packageManager
+            val VENDING = "com.android.vending"
+
+            // 一个 SigningInfo → 规范化指纹(所有 signer 的 cert-SHA256,排序去序拼接),两源可比。
+            fun sigFingerprint(si: android.content.pm.SigningInfo?): String? {
+                if (si == null) return null
+                val sigs: Array<android.content.pm.Signature>? =
+                    si.apkContentsSigners?.takeIf { it.isNotEmpty() } ?: si.signingCertificateHistory
+                if (sigs.isNullOrEmpty()) return null
+                val md = java.security.MessageDigest.getInstance("SHA-256")
+                return sigs.map { s ->
+                    md.reset()
+                    md.digest(s.toByteArray()).joinToString("") { b -> "%02x".format(b) }
+                }.sorted().joinToString(",")
+            }
+
+            // 单次读取 InstallSourceInfo(NameNotFound / SecurityException 时为 null)。
+            val isi: android.content.pm.InstallSourceInfo? =
+                runCatching { pm.getInstallSourceInfo(self) }.getOrNull()
+            // legacy(deprecated)installer,单独 runCatching(未装/不可读时 null)。
+            @Suppress("DEPRECATION")
+            val legacyInstaller: String? = runCatching { pm.getInstallerPackageName(self) }.getOrNull()
+
+            // ── installer 链:三条读路径同一逻辑值(都应 = com.android.vending)。
+            //    ghost 若只 hook getInstallSourceInfo 漏了 getInstallerPackageName(或反之),
+            //    此 field 自动跨源 size>1 = inconsistent = 漏 hook 泄漏。
+            field("installsource.installer_chain",
+                "PackageManager.getInstallerPackageName(self) [deprecated]" jLayer { legacyInstaller },
+                "InstallSourceInfo.getInstallingPackageName(self)" jLayer { isi?.installingPackageName },
+                "InstallSourceInfo.getInitiatingPackageName(self)" jLayer { isi?.initiatingPackageName },
+            )
+
+            // ── initiating 签名:ghost 塞的 initiatingPackageSigningInfo 应 == 真 vending 签名。
+            //    左源=OS 报告的 initiating 签名(ghost 已替换成真 vending),右源=直读
+            //    com.android.vending 真实签名。两者不等 = ghost 用了错 cert(或 vending 未装
+            //    导致 getVendingSigningInfo 返 null)。自动跨源查一致。
+            field("installsource.initiating_signing_sha256",
+                "InstallSourceInfo.getInitiatingPackageSigningInfo() cert-SHA256(sorted)" jLayer {
+                    sigFingerprint(isi?.initiatingPackageSigningInfo)
+                },
+                "getPackageInfo(com.android.vending, GET_SIGNING_CERTIFICATES) cert-SHA256(sorted)" jLayer {
+                    val pi = pm.getPackageInfo(VENDING,
+                        android.content.pm.PackageManager.GET_SIGNING_CERTIFICATES)
+                    sigFingerprint(pi?.signingInfo)
+                },
+            )
+
+            // ── 语义辅助字段(供跨字段规则用)──
+            field("installsource.initiating_signing_present",
+                "isi.getInitiatingPackageSigningInfo() != null" jLayer {
+                    (isi?.initiatingPackageSigningInfo != null).toString()
+                },
+            )
+            field("installsource.vending_installed",
+                "getPackageInfo(com.android.vending) 是否可见/已装" jLayer {
+                    runCatching {
+                        val pi = pm.getPackageInfo(VENDING, 0)
+                        "true (v=${pi.versionName})"
+                    }.getOrDefault("false")
+                },
+            )
+            field("installsource.originating",
+                "InstallSourceInfo.getOriginatingPackageName(self)(Play 装应为 null)" jLayer {
+                    isi?.originatingPackageName ?: "<null>"
+                },
+            )
+            // ghost 当前未 hook getUpdateOwnerPackageName(API34)→ 若曾被非-Play 更新会泄漏真实更新者。
+            field("installsource.update_owner",
+                "InstallSourceInfo.getUpdateOwnerPackageName(self) [API34+, ghost 未 spoof]" jLayer {
+                    if (android.os.Build.VERSION.SDK_INT < 34) "<n/a pre-34>"
+                    else (isi?.updateOwnerPackageName ?: "<null>")
+                },
+            )
+        }
+
+        // ============================================================
+        // misc-coverage — 补 3 项缺口:
+        //   (1) SettingsProvider android_id: provider API(hooked uid 被 spoof)vs 直读 settings_ssaid.xml 真值
+        //   (2) PackageRelocator: 本 app nativeLibraryDir / splitSourceDirs / 全路径 token 快照(跨会话 diff 交给别处)
+        //   (accessibility 项无新采集,仅 CrossFieldChecker 加规则)
+        // ============================================================
+        category("misc-coverage") {
+            // ---- (1) android_id 双源:SettingsProvider spoof vs settings_ssaid.xml 真值 ----
+            // ghost SettingsProviderHook.replaceValueByKey("android_id") 只改 provider 返回值(hooked uid),
+            // 从不重写磁盘 /data/system/users/0/settings_ssaid.xml。∴ 直读文件拿到的是真 ssaid,与 API 值不符=穿帮。
+            // 文件是 root-only(system:system 0600),app uid 直读必 EACCES → native 源大概率 null(runCatching 兜);
+            // su cat 是 ground-truth 路径(farming 设备恒 root)。任一真值源可读且 ≠ API 值 → 双源 field 自动判不一致。
+            val myPkg = context.packageName
+            // Android 12+ settings_ssaid.xml 是 ABX(二进制 XML),但属性字符串(package/ssaid)以 ASCII 内嵌,
+            // 且 ABX 里 value 属性紧邻 package 之前。兼容明文 XML(老机/备份)与 ABX 两种格式。
+            val parseSsaid = fun(raw: String): String? {
+                if (raw.isBlank()) return null
+                // 1) 明文 XML: <setting ... package="myPkg" ... value="XXXXXXXXXXXXXXXX"/>
+                Regex("<setting\\b[^>]*>").findAll(raw)
+                    .map { it.value }
+                    .firstOrNull { t -> Regex("package=\"([^\"]*)\"").find(t)?.groupValues?.get(1) == myPkg }
+                    ?.let { t -> Regex("value=\"([0-9A-Fa-f]{16})\"").find(t)?.groupValues?.get(1) }
+                    ?.let { return it }
+                // 2) ABX 二进制: 定位 pkg 名,取其前方最近的 16-hex token(= value 属性,ssaid 恒 16 hex)
+                val idx = raw.indexOf(myPkg)
+                if (idx < 0) return null
+                val before = raw.substring(maxOf(0, idx - 48), idx)
+                return Regex("[0-9A-Fa-f]{16}").findAll(before).lastOrNull()?.value
+            }
+            field("android_id.file_vs_api",
+                "Settings.Secure.ANDROID_ID(hooked uid → SettingsProvider spoof)" jLayer {
+                    Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+                },
+                "settings_ssaid.xml 直读(native syscall,真值;无 root 时 EACCES→null)" nLayer {
+                    parseSsaid(NativeBridge.readFile("/data/system/users/0/settings_ssaid.xml", 262144))
+                },
+                // ★su 源必须超时保护:app fork su 若需交互授权/授权被 newphone 重置会**永久阻塞**整个采集线程
+                //   (实测 cycle 后挂死);用 Future 限 3s,超时 cancel,读不到就 null(不参与一致性)。
+                "settings_ssaid.xml via su cat(root ground-truth,3s 超时防挂)" sLayer {
+                    val ex = java.util.concurrent.Executors.newSingleThreadExecutor()
+                    val fut = ex.submit(java.util.concurrent.Callable {
+                        val p = Runtime.getRuntime()
+                            .exec(arrayOf("su", "-c", "cat /data/system/users/0/settings_ssaid.xml"))
+                        try { p.inputStream.bufferedReader().use { it.readText() } } finally { p.destroy() }
+                    })
+                    val out = try {
+                        fut.get(3, java.util.concurrent.TimeUnit.SECONDS)
+                    } catch (t: Throwable) { fut.cancel(true); null } finally { ex.shutdownNow() }
+                    if (out.isNullOrEmpty()) null else parseSsaid(out)
+                },
+            )
+
+            // ---- (2) PackageRelocator 路径快照(单源,跨会话 diff 交给别处)----
+            // relocator 批量 mv /data/app/~~token 并反射 sweep PMS 的 codePath/nativeLibraryDir/splitCodePaths。
+            // 真机群每台 token 唯一;install-once 复用 → 同 app token 跨"一键新机"恒定 = 物理机牧场信号。
+            // 这些字段只做快照,由外部跨会话对比:恒定=牧场暴露,跨新机变=per-device 派生生效(安全)。
+            field("relocator.self_native_lib_dir",
+                "applicationInfo.nativeLibraryDir(relocator sweep 的路径之一;跨新机应变)" jLayer {
+                    context.applicationInfo.nativeLibraryDir ?: "<none>"
+                },
+            )
+            field("relocator.self_split_dirs",
+                "applicationInfo.splitSourceDirs(relocator sweep splitCodePaths;跨新机应变)" jLayer {
+                    context.applicationInfo.splitSourceDirs?.joinToString(",")?.ifEmpty { null } ?: "<no-splits>"
+                },
+            )
+            field("relocator.self_path_tokens",
+                "本 app base/split/nativeLib 的 /data/app ~~outer/pkg-inner token(跨会话快照:恒定=牧场路径指纹,应跨新机变)" jLayer {
+                    val ai = context.applicationInfo
+                    val paths = mutableListOf<String>()
+                    ai.sourceDir?.let { paths.add(it) }
+                    ai.splitSourceDirs?.let { paths.addAll(it) }
+                    ai.nativeLibraryDir?.let { paths.add(it) }
+                    val tokens = paths.mapNotNull { p ->
+                        Regex("/data/app/(~~[^/]+)/([^/]+)").find(p)?.let { "${it.groupValues[1]}/${it.groupValues[2]}" }
+                    }.distinct().sorted()
+                    if (tokens.isEmpty()) "<no-data-app-token:${paths.joinToString(";").take(80)}>"
+                    else tokens.joinToString(",")
                 },
             )
         }
@@ -1796,6 +2676,237 @@ class GhostCollector(private val context: Context) {
             )
             field("app.installed_count",
                 "getInstalledPackages.size" jLayer { installedPkgs.size.toString() },
+            )
+
+            // ── M0b:重构验收探针 ──
+            // ★peer_visible:verify 自己是 scoped(被 hook)app,查一组常见 farmed/社交 app 是否可见。
+            //   隐藏 bug(勾选的 farmed app 互相隐藏)修好后,已装的这些应全可见。用户对照"实际装了哪些"判定:
+            //   装了却 not-visible = 隐藏 bug 未修;没装的 not-visible 是正常。
+            field("app.peer_visible",
+                "getPackageInfo(farmed/社交 app) 从 verify(scoped caller)视角" jLayer {
+                    val peers = listOf(
+                        "com.twitter.android", "com.instagram.android", "com.facebook.katana",
+                        "com.facebook.orca", "com.whatsapp", "com.snapchat.android",
+                        "com.zhiliaoapp.musically", "com.google.android.youtube",
+                        "com.google.android.gm", "com.android.chrome",
+                        "com.google.android.apps.maps", "com.android.vending",
+                    )
+                    val pm = context.packageManager
+                    val vis = peers.filter {
+                        runCatching { pm.getPackageInfo(it, 0); true }.getOrDefault(false)
+                    }
+                    val hid = peers - vis.toSet()
+                    "visible=${vis.size}/${peers.size} | not-visible=[${hid.joinToString(",")}]"
+                },
+            )
+            // ★visible_list_hash:可见非系统 app 列表的稳定 hash → 跨两次一键新机对比应【不同】(反聚类),
+            //   同一 identity 内多次采集应【相同】(稳定)。
+            field("app.visible_list_hash",
+                "sha256(sorted 可见非系统包名)" jLayer {
+                    val pkgs = context.packageManager.getInstalledPackages(0)
+                        .filter { ((it.applicationInfo?.flags ?: 0) and android.content.pm.ApplicationInfo.FLAG_SYSTEM) == 0 }
+                        .map { it.packageName }.sorted()
+                    val h = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(pkgs.joinToString(",").toByteArray())
+                        .joinToString("") { "%02x".format(it) }.take(16)
+                    "hash=$h count=${pkgs.size}"
+                },
+            )
+            // ★installtime_spread:抽样 farmed app 的 firstInstallTime 分布(package-state)。
+            //   真机账龄散布;farm 若全同一时刻装 = 可疑。span=最早到最晚跨天数。
+            field("app.installtime_spread",
+                "firstInstallTime 抽样(账龄散布 vs 全同时间)" jLayer {
+                    val pm = context.packageManager
+                    // 只抽**第三方 farmed app**(系统 app 的 firstInstallTime=镜像时间会把 span 拉爆,无意义)
+                    val sample = listOf(
+                        "com.twitter.android", "com.instagram.android", "com.facebook.katana",
+                        "com.facebook.orca", "com.whatsapp", "com.zhiliaoapp.musically",
+                        "com.snapchat.android", "com.reddit.frontpage",
+                    )
+                    val times = sample.mapNotNull { p ->
+                        runCatching { pm.getPackageInfo(p, 0).firstInstallTime }.getOrNull()?.let { p to it }
+                    }
+                    if (times.isEmpty()) "<none-installed>"
+                    else {
+                        val ts = times.map { it.second }
+                        val spanDays = (ts.max() - ts.min()) / 86_400_000.0
+                        val fmt = java.text.SimpleDateFormat("MM-dd", java.util.Locale.US)
+                        // label:去掉 com. 前缀取前 14 字符(com.twitter.android→twitter.android,不再误显示成 android)
+                        "n=${times.size} span=${"%.1f".format(spanDays)}d " +
+                            times.joinToString(" ") { "${it.first.removePrefix("com.").take(14)}=${fmt.format(java.util.Date(it.second))}" }
+                    }
+                },
+            )
+        }
+
+        // ============================================================
+        // R2. 安装列表 spoof 攻防面板(配合 ghost InstalledAppProfile 投影/伪造)
+        //     模拟风控 SDK 的多种枚举/探测路径,交叉校验找伪造穿帮:
+        //      成果面:fingerprint(反聚类)/ brand_match / oem_store / cardinality
+        //      脆弱点:多向量 count 差异 + null 签名 + 无 launcher = 伪造包在不同路径下露馅
+        // ============================================================
+        category("installed-apps") {
+            val pm = context.packageManager
+            val brand = android.os.Build.BRAND.lowercase()
+
+            // ---- 多向量枚举(风控 SDK 可能用任一路径;伪造包在不同路径下会不一致) ----
+            // V1: getInstalledPackages(0) —— 最常用 bulk
+            val pkgNames = runCatching { pm.getInstalledPackages(0).map { it.packageName } }
+                .getOrElse { emptyList() }
+            val pkgSet = pkgNames.toSet()
+            // V2: getInstalledApplications(0) —— 另一条 hook 路径(ComputerEngineHook 单独伪造)
+            val appNames = runCatching { pm.getInstalledApplications(0).map { it.packageName } }
+                .getOrElse { emptyList() }.toSet()
+            // V3: pm list packages —— shell(以本 app uid 走回 PMS,应与 V1 一致)
+            val pmListNames = runCatching {
+                val p = Runtime.getRuntime().exec(arrayOf("sh", "-c", "pm list packages"))
+                p.inputStream.bufferedReader().readLines()
+                    .mapNotNull { it.removePrefix("package:").trim().takeIf { s -> s.isNotEmpty() } }.toSet()
+            }.getOrElse { emptySet() }
+            // V4: queryIntentActivities(LAUNCHER) —— 可启动 app;伪造包无 launcher → 缺席
+            val launcherNames = runCatching {
+                val i = android.content.Intent(android.content.Intent.ACTION_MAIN)
+                    .addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+                pm.queryIntentActivities(i, 0).mapNotNull { it.activityInfo?.packageName }.toSet()
+            }.getOrElse { emptySet() }
+            // V5: GET_SIGNATURES —— 伪造包无签名
+            @Suppress("DEPRECATION")
+            val withSig = runCatching {
+                pm.getInstalledPackages(android.content.pm.PackageManager.GET_SIGNATURES)
+            }.getOrElse { emptyList() }
+            @Suppress("DEPRECATION")
+            val noSigSet = withSig.filter { it.signatures == null || it.signatures?.isEmpty() == true }
+                .map { it.packageName }.toSet()
+
+            // ---- 成果面 ----
+            field("applist.count_multi",
+                "getInstalledPackages / getInstalledApplications / pm-list" jLayer {
+                    "pkgs=${pkgNames.size} apps=${appNames.size} pmlist=${pmListNames.size}"
+                },
+            )
+            field("applist.fingerprint",
+                "sha256(sorted pkg list)[0:12] —— 跨新机应变化(反聚类)" jLayer {
+                    val md = java.security.MessageDigest.getInstance("SHA-256")
+                    md.digest(pkgNames.sorted().joinToString("\n").toByteArray())
+                        .joinToString("") { "%02x".format(it) }.take(12)
+                },
+            )
+            field("applist.brand_match",
+                "Build.BRAND vs OEM pkg presence" jLayer {
+                    val expect = when {
+                        brand == "samsung" -> listOf("com.samsung.", "com.sec.")
+                        brand in setOf("xiaomi", "redmi", "poco") -> listOf("com.miui.", "com.xiaomi.")
+                        brand in setOf("oppo", "realme", "oneplus") ->
+                            listOf("com.coloros.", "com.oppo.", "com.heytap.", "com.oplus.")
+                        brand == "vivo" -> listOf("com.vivo.", "com.iqoo.")
+                        brand == "motorola" -> listOf("com.motorola.")
+                        brand == "honor" -> listOf("com.hihonor.")
+                        brand == "sony" -> listOf("com.sonymobile.", "com.sonyericsson.")
+                        brand in setOf("infinix", "tecno", "itel") -> listOf("com.transsion.", "com.transsnet.")
+                        brand in setOf("nubia", "zte") -> listOf("cn.nubia.", "com.zte.")
+                        brand == "asus" -> listOf("com.asus.")
+                        brand == "meizu" -> listOf("com.meizu.")
+                        brand == "nothing" -> listOf("com.nothing.")
+                        brand in setOf("lge", "lg") -> listOf("com.lge.")
+                        else -> emptyList()
+                    }
+                    if (expect.isEmpty()) "n/a (brand=$brand 用 Play 系,无 OEM 预期)"
+                    else {
+                        val hit = pkgNames.count { p -> expect.any { p.startsWith(it) } }
+                        if (hit > 0) "ok ($hit OEM pkgs, brand=$brand)"
+                        else "MISSING (brand=$brand 但列表 0 个 OEM 包)"
+                    }
+                },
+            )
+            field("applist.oem_store",
+                "store in-list vs queryIntent(APP_MARKET)" jLayer {
+                    val storePkg = when {
+                        brand == "samsung" -> "com.sec.android.app.samsungapps"
+                        brand in setOf("xiaomi", "redmi", "poco") -> "com.xiaomi.market"
+                        brand in setOf("oppo", "realme", "oneplus") -> "com.heytap.market"
+                        brand == "vivo" -> "com.vivo.appstore"
+                        brand == "honor" -> "com.hihonor.appmarket"
+                        brand in setOf("infinix", "tecno", "itel") -> "com.transsnet.store"
+                        brand in setOf("nubia", "zte") -> "cn.nubia.neostore"
+                        brand == "meizu" -> "com.meizu.mstore"
+                        brand in setOf("lge", "lg") -> "com.lge.appbox.client"
+                        else -> null  // Sony/asus/Nothing/google 用 Play,无独立商店
+                    }
+                    if (storePkg == null) "n/a (brand=$brand 用 Play)"
+                    else {
+                        val inList = storePkg in pkgSet
+                        val resolvable = runCatching {
+                            val i = android.content.Intent(android.content.Intent.ACTION_MAIN)
+                                .addCategory("android.intent.category.APP_MARKET")
+                            pm.queryIntentActivities(i, 0).any { it.activityInfo?.packageName == storePkg }
+                        }.getOrDefault(false)
+                        when {
+                            inList && resolvable -> "ok (present + resolvable)"
+                            inList && !resolvable -> "MISMATCH (在列表但 queryIntent 解析不到 = 伪造商店穿帮)"
+                            else -> "MISSING ($storePkg 不在列表)"
+                        }
+                    }
+                },
+            )
+
+            // ---- 脆弱点(攻方视角) ----
+            // 跨向量一致性:getInstalledPackages vs getInstalledApplications vs pm list 差异。
+            // 三条路径若非同源伪造会不一致 —— 差异大 = 某路径漏伪造。
+            field("applist.vector_delta",
+                "|pkgs∖apps| + |pkgs∖pmlist|(跨枚举路径差异,应≈0)" jLayer {
+                    val dApps = (pkgSet - appNames).size
+                    val dPm = (pkgSet - pmListNames).size
+                    "pkgs∖apps=$dApps pkgs∖pmlist=$dPm"
+                },
+            )
+            // ★ 核心攻方指标:在 bulk 列表里、但既无 launcher 又无签名 = 伪造包被交叉校验隔离出来。
+            // 真实 app 大多可启动或至少有签名;这批"幽灵包"是签名+launcher 双探针能抓的伪造集。
+            field("applist.ghost_pkgs",
+                "in-bulk ∧ ¬launcher ∧ ¬signed(交叉校验隔离出的伪造集)" jLayer {
+                    val ghost = pkgNames.filter { it !in launcherNames && it in noSigSet }
+                    if (ghost.isEmpty()) "0"
+                    else "${ghost.size} (${ghost.take(6).joinToString(",")}${if (ghost.size > 6) "…" else ""})"
+                },
+            )
+            // 纯签名探针能抓的数量(GET_SIGNATURES null)
+            field("applist.nosig_count",
+                "getInstalledPackages(GET_SIGNATURES) null-sig 数" jLayer {
+                    val list = noSigSet.toList()
+                    if (list.isEmpty()) "0"
+                    else "${list.size} (${list.take(6).joinToString(",")}${if (list.size > 6) "…" else ""})"
+                },
+            )
+
+            // ★ 设备牧场路径痕迹检测:APK sourceDir + /proc/self/maps 的 /data/app 随机 hash。
+            //   install-once 复用(install-existing / 数据交换式还原)→ 同 app 的路径 hash
+            //   跨"一键新机"恒定 → 一台物理机的牧场信号(真机群每台 hash 不同)。
+            //   跨两次新机采集对比此 fingerprint:变化=路径每设备唯一(安全);恒定=牧场暴露。
+            field("applist.path_fingerprint",
+                "sha256(自身+抽样app sourceDir + self maps base.apk)[0:12] —— 跨新机应变化" jLayer {
+                    val parts = mutableListOf<String>()
+                    runCatching { context.applicationInfo.sourceDir?.let { parts.add(it) } }
+                    runCatching {
+                        java.io.File("/proc/self/maps").readLines()
+                            .firstOrNull { it.contains("/data/app/") && it.endsWith("base.apk") }
+                            ?.let { line -> Regex("/data/app/\\S+base\\.apk").find(line)?.value?.let { parts.add(it) } }
+                    }
+                    runCatching {
+                        pm.getInstalledApplications(0)
+                            .mapNotNull { it.sourceDir }
+                            .filter { it.startsWith("/data/app/") }
+                            .sorted().take(12).forEach { parts.add(it) }
+                    }
+                    val md = java.security.MessageDigest.getInstance("SHA-256")
+                    md.digest(parts.joinToString("\n").toByteArray()).joinToString("") { "%02x".format(it) }.take(12)
+                },
+            )
+            // 原始样本:自身 APK 的 /data/app 随机 token(人肉核对跨设备是否恒定)
+            field("applist.path_sample",
+                "自身 APK /data/app hash token(跨设备应不同)" jLayer {
+                    context.applicationInfo.sourceDir?.let {
+                        Regex("~~[^/]+").find(it)?.value ?: it.take(48)
+                    } ?: "<none>"
+                },
             )
         }
 
@@ -2231,6 +3342,13 @@ class GhostCollector(private val context: Context) {
     // ========================================================================
     // Utility采集函数
     // ========================================================================
+    /** 布尔归一化:1/true/enabled→"true",0/false/disabled→"false",其余(null/n/a/空/未知)→null 不参与一致性。 */
+    private fun normBool(v: String?): String? = when (v?.trim()?.lowercase()) {
+        "1", "true", "enabled" -> "true"
+        "0", "false", "disabled" -> "false"
+        else -> null
+    }
+
     private fun getpropShell(key: String): String {
         return try {
             val proc = Runtime.getRuntime().exec(arrayOf("getprop", key))
@@ -2247,6 +3365,106 @@ class GhostCollector(private val context: Context) {
             ?.substringAfter(":")
             ?.trim()
             ?: ""
+    }
+
+    private val ENV_KEYWORDS = listOf(
+        "magisk", "kernelsu", "sukisu", "ksu", "apatch",
+        "zygisk", "riru", "lsposed", "lspd", "xposed", "edxposed", "lspatch",
+        "frida", "gum-js-loop", "gadget",
+        "susfs", "tricky", "trickystore", "playintegrityfix",
+        "libplay", "dobby", "libru", "riru_lsposed",
+        "com.tt.hi", "hidemyapplist",
+        "org.auto.auto", "autojs", "autoxjs",
+        "moe.nb4a", "nekobox", "kitsunebi", "reqable",
+        "/data/adb", "/data/system/.a", "/data/oat/libplay", " abcd"
+    )
+
+    private val SERVICE_KEYWORDS = listOf(
+        "iphonesubinfo", "phone", "package", "accessibility", "connectivity",
+        "vpn", "keystore", "mount", "activity", "user"
+    )
+
+    private fun summarizeKeywordLines(
+        text: String,
+        keywords: List<String> = ENV_KEYWORDS,
+        maxLines: Int = 6
+    ): String {
+        if (text.isBlank()) return "clean"
+        val hits = mutableListOf<String>()
+        val matchedKeywords = linkedSetOf<String>()
+        text.lineSequence().forEach { line ->
+            val low = line.lowercase()
+            val kws = keywords.filter { kw -> low.contains(kw.lowercase()) }
+            if (kws.isNotEmpty()) {
+                matchedKeywords += kws
+                if (hits.size < maxLines) hits += line.trim().replace('\u0000', ' ').take(160)
+            }
+        }
+        return if (matchedKeywords.isEmpty()) {
+            "clean"
+        } else {
+            "${hits.size}+ samples kw=${matchedKeywords.take(12).joinToString(",")} sample=${hits.joinToString(" | ")}"
+        }
+    }
+
+    private fun normalizeProbeOutput(out: String): String {
+        if (out.isBlank()) return "<empty>"
+        return out.lineSequence()
+            .map { it.trim().replace('\u0000', ' ') }
+            .filter { it.isNotEmpty() }
+            .joinToString(" | ")
+            .take(900)
+    }
+
+    private fun summarizePathProbes(paths: List<String>): String {
+        val exposed = mutableListOf<String>()
+        val blocked = mutableListOf<String>()
+        val absent = mutableListOf<String>()
+
+        for (path in paths) {
+            val file = java.io.File(path)
+            val javaExists = runCatching { file.exists() }.getOrDefault(false)
+            val javaReadable = runCatching { file.canRead() }.getOrDefault(false)
+            val javaListable = runCatching { file.isDirectory && file.list() != null }.getOrDefault(false)
+            val stat = NativeBridge.statFile(path)
+            val svcStat = NativeBridge.statFileViaSyscall(path)
+            val read = NativeBridge.readFile(path, 64).isNotEmpty()
+            val shell = NativeBridge.execShell("ls -ld '$path' 2>&1", 512).trim()
+            val shellLow = shell.lowercase()
+
+            val isExposed = javaExists || javaReadable || javaListable ||
+                stat.isNotEmpty() || svcStat.isNotEmpty() || read ||
+                (shell.isNotEmpty() &&
+                    !shellLow.contains("no such") &&
+                    !shellLow.contains("permission denied") &&
+                    !shellLow.contains("not found"))
+            val isBlocked = !isExposed && shellLow.contains("permission denied")
+            when {
+                isExposed -> exposed += "$path[java=$javaExists/$javaReadable/$javaListable stat=${stat.shortProbe()} svc=${svcStat.shortProbe()} shell=${shell.take(80)}]"
+                isBlocked -> blocked += path
+                else -> absent += path
+            }
+        }
+
+        return buildString {
+            append("exposed=${exposed.size} blocked=${blocked.size} absent=${absent.size}")
+            if (exposed.isNotEmpty()) append(" exposed_samples=${exposed.take(5).joinToString(" | ")}")
+            if (blocked.isNotEmpty()) append(" blocked_samples=${blocked.take(5).joinToString(",")}")
+        }
+    }
+
+    private fun String.shortProbe(): String =
+        if (isBlank()) "-" else replace(',', ';').take(48)
+
+    private fun readProcSelfFdLinks(): List<String> {
+        val dir = java.io.File("/proc/self/fd")
+        val files = runCatching { dir.listFiles()?.toList() ?: emptyList() }.getOrDefault(emptyList())
+        return files.mapNotNull { fd ->
+            runCatching {
+                val target = java.nio.file.Files.readSymbolicLink(fd.toPath()).toString()
+                "${fd.name} -> $target"
+            }.getOrNull()
+        }
     }
 
     @SuppressLint("HardwareIds")
@@ -2432,10 +3650,21 @@ class GhostCollector(private val context: Context) {
     // ========================================================================
     private data class KeystoreAttestation(
         val chainLength: Int = 0,
+        val chainVerified: String? = null,        // ★K1:逐级 verify(parent.pub);"true"/"false(link i:..)"
+        val leafValidityHours: Long? = null,      // ★K1:leaf notAfter-notBefore(真机数千h;ghost 伪 leaf ~1h)
+        val rootPubKeySha256: String? = null,     // ★K1:根证书公钥 SHA256(vs Google hw-attest root)
         val attestationVersion: Int? = null,
         val attestationSecurityLevel: String? = null,
         val keymasterVersion: Int? = null,
         val keymasterSecurityLevel: String? = null,
+        val osVersion: Int? = null,               // ★K3:[705] eg 130000→A13
+        val osPatchLevel: Int? = null,            // ★K3:[706] eg 202401→2024-01
+        val verifiedBootState: Int? = null,       // ★K2:[704] 0=Verified 1=SelfSigned 2=Unverified 3=Failed
+        val deviceLocked: Boolean? = null,        // ★K2:[704] deviceLocked
+        val verifiedBootKeyHex: String? = null,   // ★K2:[704] verifiedBootKey(随机=锚)
+        val verifiedBootHashHex: String? = null,  // ★K2:[704] verifiedBootHash(跨采集变=锚)
+        val keyInfoSecurityLevel: String? = null, // ★K4:KeyInfo.getSecurityLevel(API31+)
+        val insideSecureHardware: Boolean? = null,// ★K4:KeyInfo.isInsideSecureHardware
         val idBrand: String? = null,
         val idDevice: String? = null,
         val idProduct: String? = null,
@@ -2484,9 +3713,34 @@ class GhostCollector(private val context: Context) {
             val chain = ks.getCertificateChain(alias)
                 ?: return@runCatching KeystoreAttestation(error = "no cert chain")
             val leaf = chain[0] as java.security.cert.X509Certificate
+
+            // ★K1:逐级验签 leaf→…→root(ghost 伪 leaf 用自己私钥重签→对不上 Google 中间证书公钥=失败=最强穿帮)
+            var chainVerified = "true"
+            for (i in 0 until chain.size - 1) {
+                val vr = runCatching { (chain[i] as java.security.cert.X509Certificate).verify(chain[i + 1].publicKey) }
+                if (vr.isFailure) { chainVerified = "false(link $i:${vr.exceptionOrNull()?.javaClass?.simpleName})"; break }
+            }
+            // ★K1:leaf 有效期跨度(真机 attestation leaf 数千~数万小时;ghost 伪 leaf 常 notBefore+1h)+ root 公钥 SHA256
+            val leafValidityHours = (leaf.notAfter.time - leaf.notBefore.time) / 3_600_000L
+            val rootSha = runCatching {
+                java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(chain[chain.size - 1].publicKey.encoded)
+                    .joinToString("") { "%02x".format(it) }
+            }.getOrNull()
+            // ★K4:KeyInfo securityLevel/insideSecureHardware(须在 deleteEntry 前读;vs attestation level 交叉)
+            val ki = runCatching {
+                val priv = ks.getKey(alias, null) as java.security.PrivateKey
+                val kf = java.security.KeyFactory.getInstance(priv.algorithm, "AndroidKeyStore")
+                kf.getKeySpec(priv, android.security.keystore.KeyInfo::class.java)
+            }.getOrNull()
+            val kiLevel = ki?.let { if (Build.VERSION.SDK_INT >= 31) runCatching { securityLevelName(it.securityLevel) }.getOrNull() else null }
+            val kiInside = ki?.isInsideSecureHardware
+
             // OID 1.3.6.1.4.1.11129.2.1.17 = Google KeyDescription extension
             val rawWrapped = leaf.getExtensionValue("1.3.6.1.4.1.11129.2.1.17")
                 ?: return@runCatching KeystoreAttestation(chainLength = chain.size,
+                    chainVerified = chainVerified, leafValidityHours = leafValidityHours, rootPubKeySha256 = rootSha,
+                    keyInfoSecurityLevel = kiLevel, insideSecureHardware = kiInside,
                     error = "no attestation extension(non-TEE root chain)")
 
             // getExtensionValue 返回 ASN.1 OCTET STRING wrapped 的 raw bytes
@@ -2495,7 +3749,9 @@ class GhostCollector(private val context: Context) {
             val parsed = parseAttestationExtension(inner)
 
             runCatching { ks.deleteEntry(alias) }
-            parsed.copy(chainLength = chain.size)
+            parsed.copy(chainLength = chain.size, chainVerified = chainVerified,
+                leafValidityHours = leafValidityHours, rootPubKeySha256 = rootSha,
+                keyInfoSecurityLevel = kiLevel, insideSecureHardware = kiInside)
         }.getOrElse { t ->
             KeystoreAttestation(error = "${t.javaClass.simpleName}: ${t.message?.take(60)}")
         }
@@ -2572,6 +3828,9 @@ class GhostCollector(private val context: Context) {
         //   tag 717 = 0xBF 0x85 0x4D
         var brand: String? = null; var device: String? = null; var product: String? = null
         var serial: String? = null; var manufacturer: String? = null; var model: String? = null
+        var osVersion: Int? = null; var osPatchLevel: Int? = null
+        var vbState: Int? = null; var deviceLocked: Boolean? = null
+        var vbKey: String? = null; var vbHash: String? = null
         while (idx < hwEnd) {
             val b0 = seq[idx].toInt() and 0xFF
             if (b0 == 0xBF && idx + 2 < hwEnd && (seq[idx + 1].toInt() and 0xFF) == 0x85) {
@@ -2579,22 +3838,54 @@ class GhostCollector(private val context: Context) {
                 idx += 3
                 val (oLen, oCS) = readBerLength(seq, idx); idx = oCS
                 val outerEnd = idx + oLen
-                // EXPLICIT OCTET STRING:inner 0x04 + len + bytes
-                if (idx < outerEnd && (seq[idx].toInt() and 0xFF) == 0x04) {
-                    idx++
-                    val (iLen, iCS) = readBerLength(seq, idx); idx = iCS
-                    val v = String(seq, idx, iLen, Charsets.UTF_8)
-                    when (tag) {
-                        0x46 -> brand = v   // 710
-                        0x47 -> device = v  // 711
-                        0x48 -> product = v // 712
-                        0x49 -> serial = v  // 713
-                        0x4C -> manufacturer = v  // 716
-                        0x4D -> model = v   // 717
+                val innerTag = if (idx < outerEnd) seq[idx].toInt() and 0xFF else -1
+                when {
+                    // EXPLICIT OCTET STRING → Build ID 字符串([710]-[717])
+                    innerTag == 0x04 -> {
+                        idx++
+                        val (iLen, iCS) = readBerLength(seq, idx); idx = iCS
+                        val v = String(seq, idx, iLen, Charsets.UTF_8)
+                        when (tag) {
+                            0x46 -> brand = v          // 710
+                            0x47 -> device = v         // 711
+                            0x48 -> product = v        // 712
+                            0x49 -> serial = v         // 713
+                            0x4C -> manufacturer = v   // 716
+                            0x4D -> model = v          // 717
+                        }
+                        idx += iLen
                     }
-                    idx += iLen
-                } else {
-                    idx = outerEnd
+                    // ★K3:EXPLICIT INTEGER → osVersion[705=0x41]/osPatchLevel[706=0x42]
+                    innerTag == 0x02 -> {
+                        val (iv, ni) = readInt(seq, idx); idx = ni
+                        when (tag) {
+                            0x41 -> osVersion = iv
+                            0x42 -> osPatchLevel = iv
+                        }
+                    }
+                    // ★K2:EXPLICIT SEQUENCE + tag 0x40 → RootOfTrust[704]
+                    //   { verifiedBootKey OCTET, deviceLocked BOOLEAN, verifiedBootState ENUM, [verifiedBootHash OCTET] }
+                    innerTag == 0x30 && tag == 0x40 -> {
+                        var ri = idx + 1
+                        val (_, rcs) = readBerLength(seq, ri); ri = rcs
+                        if (ri < outerEnd && (seq[ri].toInt() and 0xFF) == 0x04) {
+                            ri++; val (kl, kcs) = readBerLength(seq, ri); ri = kcs
+                            vbKey = seq.copyOfRange(ri, ri + kl).joinToString("") { "%02x".format(it) }; ri += kl
+                        }
+                        if (ri < outerEnd && (seq[ri].toInt() and 0xFF) == 0x01) {
+                            ri++; val (bl, bcs) = readBerLength(seq, ri); ri = bcs
+                            deviceLocked = (seq[ri].toInt() and 0xFF) != 0; ri += bl
+                        }
+                        if (ri < outerEnd && (seq[ri].toInt() and 0xFF) == 0x0A) {
+                            val (ev, en) = readEnum(seq, ri); vbState = ev; ri = en
+                        }
+                        if (ri < outerEnd && (seq[ri].toInt() and 0xFF) == 0x04) {
+                            ri++; val (hl, hcs) = readBerLength(seq, ri); ri = hcs
+                            vbHash = seq.copyOfRange(ri, ri + hl).joinToString("") { "%02x".format(it) }; ri += hl
+                        }
+                        idx = outerEnd
+                    }
+                    else -> idx = outerEnd
                 }
             } else {
                 idx = skipOne(seq, idx)
@@ -2605,6 +3896,9 @@ class GhostCollector(private val context: Context) {
             attestationSecurityLevel = securityLevelName(attLvl),
             keymasterVersion = kmVer,
             keymasterSecurityLevel = securityLevelName(kmLvl),
+            osVersion = osVersion, osPatchLevel = osPatchLevel,
+            verifiedBootState = vbState, deviceLocked = deviceLocked,
+            verifiedBootKeyHex = vbKey, verifiedBootHashHex = vbHash,
             idBrand = brand, idDevice = device, idProduct = product,
             idSerial = serial, idManufacturer = manufacturer, idModel = model,
         )
