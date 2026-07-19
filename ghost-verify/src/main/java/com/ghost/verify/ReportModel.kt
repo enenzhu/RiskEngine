@@ -865,6 +865,51 @@ object CrossFieldChecker {
             }
         }
 
+        // === Bluetooth 名跨 binder(bt-webview-drm 组)===
+        // ghost 经 SettingsProvider spoof device_name;BluetoothAdapter.getName() 走独立 binder 可能泄漏真名。
+        run {
+            val adapter = map["bt.adapter_name"]?.canonicalValue
+            val settingsName = map["bt.settings_device_name"]?.canonicalValue
+            if (!adapter.isNullOrBlank() && !adapter.startsWith("<") &&
+                !settingsName.isNullOrBlank() && adapter != settingsName) {
+                violations += CrossFieldViolation(
+                    ruleName = "BLUETOOTH_NAME_VS_SETTINGS", severity = "high",
+                    fields = listOf("bt.adapter_name", "bt.settings_device_name"),
+                    values = mapOf("bt.adapter_name" to adapter, "bt.settings_device_name" to settingsName),
+                    expected = "BluetoothAdapter.getName() 应 == Settings device_name(同一设备名)",
+                    note = "BluetoothAdapter.getName()(独立 IBluetooth binder)≠ SettingsProvider spoof 的 device_name = 真蓝牙名泄漏(ghost 没覆盖 binder 路径)"
+                )
+            }
+        }
+        // === WebView provider 声称已装(bt-webview-drm 组)===
+        map["webview.provider_installed"]?.canonicalValue?.let { inst ->
+            if (inst.startsWith("NOT_INSTALLED")) {
+                violations += CrossFieldViolation(
+                    ruleName = "WEBVIEW_PROVIDER_NOT_INSTALLED", severity = "high",
+                    fields = listOf("webview.current_package", "webview.provider_installed"),
+                    values = mapOf("webview.current_package" to map["webview.current_package"]?.canonicalValue,
+                                   "webview.provider_installed" to inst),
+                    expected = "getCurrentWebViewPackage() 声称的 provider 必须真实已安装",
+                    note = "ghost 把 WebView provider spoof 成 com.brave.browser 但该包未真装 → getPackageInfo 查不到=硬穿帮(声称的渲染引擎不存在)"
+                )
+            }
+        }
+        // === K7:Widevine L1(硬件 DRM)vs Software keystore(无 TEE)矛盾 ===
+        run {
+            val wvLevel = map["Widevine.securityLevel"]?.canonicalValue
+            val attLevel = map["tee.attestation_security_level"]?.canonicalValue
+            if (wvLevel != null && wvLevel.contains("L1") &&
+                attLevel != null && attLevel.contains("Software", ignoreCase = true)) {
+                violations += CrossFieldViolation(
+                    ruleName = "WIDEVINE_L1_VS_SOFTWARE_KEYSTORE", severity = "high",
+                    fields = listOf("Widevine.securityLevel", "tee.attestation_security_level"),
+                    values = mapOf("Widevine.securityLevel" to wvLevel, "tee.attestation_security_level" to attLevel),
+                    expected = "Widevine L1(硬件 DRM)⇒ keystore 应硬件支持(TEE/StrongBox)",
+                    note = "L1 硬件 DRM 依赖 TEE/TrustZone,但 keystore attestation 报 Software(无硬件)=自相矛盾锚"
+                )
+            }
+        }
+
         return violations
     }
 

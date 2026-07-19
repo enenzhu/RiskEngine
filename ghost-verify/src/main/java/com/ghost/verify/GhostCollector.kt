@@ -3347,6 +3347,57 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // Bluetooth 名 / WebView provider / MediaDrm(K7)
+        // ============================================================
+        category("bt-webview-drm") {
+            // Bluetooth:ghost SettingsProviderHook spoof device_name/bluetooth_name→props.name;
+            //   BluetoothAdapter.getName() 走独立 IBluetooth binder(不经 SettingsProvider)可能泄漏真名
+            //   (需 BLUETOOTH_CONNECT,无权限时 <denied>,规则跳过不误报)。
+            field("bt.settings_device_name",
+                "Settings.Global device_name" jLayer {
+                    runCatching { Settings.Global.getString(context.contentResolver, "device_name") }.getOrNull()
+                },
+                "Settings.Secure bluetooth_name" jLayer {
+                    runCatching { Settings.Secure.getString(context.contentResolver, "bluetooth_name") }.getOrNull()
+                },
+            )
+            field("bt.adapter_name",
+                "BluetoothAdapter.getName()(独立 binder,可能泄漏真名)" jLayer {
+                    runCatching {
+                        val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? android.bluetooth.BluetoothManager
+                        bm?.adapter?.name
+                    }.getOrElse { "<denied> ${it.javaClass.simpleName}" }
+                },
+            )
+            // WebView provider:ghost 把 provider packageName→com.brave.browser(仅当已装)+ validityResult=0。
+            field("webview.current_package",
+                "WebView.getCurrentWebViewPackage().packageName" jLayer {
+                    runCatching { android.webkit.WebView.getCurrentWebViewPackage()?.packageName }.getOrNull()
+                },
+            )
+            field("webview.current_version",
+                "WebView.getCurrentWebViewPackage().versionName" jLayer {
+                    runCatching { android.webkit.WebView.getCurrentWebViewPackage()?.versionName }.getOrNull()
+                },
+            )
+            // ★provider 声称的包是否真已装:声称 brave 却查不到=硬穿帮(ghost 只改 provider 名没真装)。
+            field("webview.provider_installed",
+                "getPackageInfo(current provider) 是否已装" jLayer {
+                    runCatching {
+                        val p = android.webkit.WebView.getCurrentWebViewPackage()?.packageName
+                            ?: return@runCatching "<no-provider>"
+                        context.packageManager.getPackageInfo(p, 0); "installed"
+                    }.getOrElse { "NOT_INSTALLED (${it.javaClass.simpleName})" }
+                },
+            )
+            field("webview.default_ua",
+                "WebSettings.getDefaultUserAgent" jLayer {
+                    runCatching { android.webkit.WebSettings.getDefaultUserAgent(context) }.getOrNull()
+                },
+            )
+        }
+
+        // ============================================================
         // 收尾 — 构建 report
         // ============================================================
         val timestamp = System.currentTimeMillis()
