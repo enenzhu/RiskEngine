@@ -3398,6 +3398,50 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // 电池 charge/energy + OAID + 共享库指纹
+        // ============================================================
+        category("coverage-extra") {
+            val bm = context.getSystemService(Context.BATTERY_SERVICE) as? android.os.BatteryManager
+            field("battery.charge_counter_uah",
+                "BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER(µAh)" jLayer {
+                    bm?.getLongProperty(android.os.BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)?.toString()
+                },
+            )
+            // ★ghost FakeBatteryManager: energyCounter = maxCap×(100-cap)/100(与电量**反相关**);
+            //   真机 energy(nWh) ≈ charge(µAh)×标称电压×1000(正相关,ratio≈3850)→ ghost ratio<1=异常。
+            field("battery.energy_counter_nwh",
+                "BatteryManager.BATTERY_PROPERTY_ENERGY_COUNTER(nWh)" jLayer {
+                    val e = bm?.getLongProperty(android.os.BatteryManager.BATTERY_PROPERTY_ENERGY_COUNTER)
+                    if (e == null || e == Long.MIN_VALUE) null else e.toString()
+                },
+            )
+            // OAID:ghost OaidHook 拦 SharedPreferences.getString(key=="adid_key")→settingData.oaid。
+            //   读任意 SP 的该 key:hooked→返 spoof oaid;未 hook→null。直接测 OaidHook + 拿 per-device oaid。
+            field("oaid.sp_adid_key",
+                "SharedPreferences.getString(adid_key)(ghost OaidHook 拦此 key)" jLayer {
+                    runCatching {
+                        context.getSharedPreferences("gv_oaid_probe", android.content.Context.MODE_PRIVATE)
+                            .getString("adid_key", null)
+                    }.getOrNull()
+                },
+            )
+            // 共享库指纹:ghost ComputerEngineHook 整表替换 getSystemSharedLibraryNames;
+            //   count+sha1 作跨设备指纹(所有 ghost 设备同表=弱锚;与机型 profile 差异比对)。
+            field("shared_libs.count",
+                "PackageManager.getSystemSharedLibraryNames().size" jLayer {
+                    context.packageManager.systemSharedLibraryNames?.size?.toString()
+                },
+            )
+            field("shared_libs.sha1",
+                "systemSharedLibraryNames sorted sha1" jLayer {
+                    val names = context.packageManager.systemSharedLibraryNames?.sorted()
+                        ?.joinToString("\n") ?: return@jLayer null
+                    sha1Hex(names)
+                },
+            )
+        }
+
+        // ============================================================
         // 收尾 — 构建 report
         // ============================================================
         val timestamp = System.currentTimeMillis()

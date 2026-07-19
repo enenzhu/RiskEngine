@@ -894,6 +894,28 @@ object CrossFieldChecker {
                 )
             }
         }
+        // === 电池 energy/charge 比(coverage-extra 组)===
+        // 真机 energy(nWh)≈charge(µAh)×标称电压(V)×1000 → ratio≈3000-4400;
+        // ghost FakeBatteryManager 用 energy=maxCap×(100-cap) 反相关公式 → ratio≪1 = 异常。
+        run {
+            val charge = map["battery.charge_counter_uah"]?.canonicalValue?.toLongOrNull()
+            val energy = map["battery.energy_counter_nwh"]?.canonicalValue?.toLongOrNull()
+            if (charge != null && charge > 100_000 && energy != null && energy > 0) {
+                val ratio = energy.toDouble() / charge.toDouble()
+                if (ratio < 2000 || ratio > 6000) {
+                    violations += CrossFieldViolation(
+                        ruleName = "BATTERY_ENERGY_CHARGE_RATIO", severity = "medium",
+                        fields = listOf("battery.energy_counter_nwh", "battery.charge_counter_uah"),
+                        values = mapOf("battery.energy_counter_nwh" to energy.toString(),
+                                       "battery.charge_counter_uah" to charge.toString(),
+                                       "ratio" to "%.1f".format(ratio)),
+                        expected = "energy(nWh)/charge(µAh) ≈ 标称电压×1000(≈3000-4400)",
+                        note = "ratio=%.1f 偏离标称电压 → ghost FakeBatteryManager energy 用 (100-cap) 反相关公式(真机 energy 应正比于 charge)=anchor".format(ratio)
+                    )
+                }
+            }
+        }
+
         // === K7:Widevine L1(硬件 DRM)vs Software keystore(无 TEE)矛盾 ===
         run {
             val wvLevel = map["Widevine.securityLevel"]?.canonicalValue
