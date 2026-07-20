@@ -2578,6 +2578,63 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // TLS / JA3(聚集审计悬案:JA3 spoof 是否覆盖 Java SSLSocket/Conscrypt 路径)
+        //   ghost native hook libssl.so 的 SSL_CTX_set_cipher_list/set1_curves_list/SSL_CTX_new
+        //   → 改 ClientHello 的 cipher/curve/alpn 顺序,让 JA3 跟 deviceInfo seed 走(per-identity)。
+        //   Conscrypt(HttpsURLConnection/SSLSocket)用 /apex/com.android.conscrypt/lib64/libssl.so=hook 目标。
+        //   本采集器走 conscrypt 打 tls.peet.ws echo 拿**服务端看到的真 ClientHello 指纹**:
+        //   - ja3_hash_wire / ja3_wire_raw:风控真正 TLS 指纹用的信号,跨身份应变(spoof 生效)。
+        //     ★判定:ja3_wire_raw 的 cipher 段应等于 ghost 推的 spoof 列表顺序,而非 Conscrypt 默认顺序。
+        //   - enabled_ciphers_sha1_javaapi:SSLSocket.getEnabledCipherSuites(握手前的 Java API 配置列表),
+        //     它是 Android/Conscrypt 版本恒定的(全设备一样)→ 跨身份恒定属**预期无害**、非 per-device 聚集锚
+        //     (类比 root_pubkey 全球恒定);风控 TLS 指纹用 wire ClientHello,不用这个 API 列表。
+        // ============================================================
+        category("tls-ja3") {
+            val fetchPeet = fun(): org.json.JSONObject? {
+                val ex = java.util.concurrent.Executors.newSingleThreadExecutor()
+                val fut = ex.submit(java.util.concurrent.Callable {
+                    val c = java.net.URL("https://tls.peet.ws/api/clean").openConnection()
+                            as javax.net.ssl.HttpsURLConnection
+                    c.connectTimeout = 8000; c.readTimeout = 8000
+                    try { org.json.JSONObject(c.inputStream.bufferedReader().use { it.readText() }) }
+                    finally { c.disconnect() }
+                })
+                return try { fut.get(12, java.util.concurrent.TimeUnit.SECONDS) }
+                    catch (t: Throwable) { fut.cancel(true); null } finally { ex.shutdownNow() }
+            }
+            val peet = fetchPeet()   // 一次握手,多字段共享
+            field("tls.ja3_hash_wire",
+                "HttpsURLConnection(Conscrypt)→tls.peet.ws 的 ja3_hash(服务端看到的真 ClientHello;JA3 spoof 生效则跨身份变)" jLayer {
+                    peet?.optString("ja3_hash")?.ifEmpty { null }
+                },
+            )
+            field("tls.ja3_wire_raw",
+                "同上 ja3 数值串(cipher/ext/curve 列表;★其 cipher 段应=ghost spoof 顺序而非 Conscrypt 默认)" jLayer {
+                    peet?.optString("ja3")?.ifEmpty { null }
+                },
+            )
+            field("tls.peetprint_hash_wire",
+                "peetprint_hash(比 JA3 更细,含 alpn/curves 顺序;跨身份应变)" jLayer {
+                    peet?.optString("peetprint_hash")?.ifEmpty { null }
+                },
+            )
+            field("tls.enabled_ciphers_sha1_javaapi",
+                "SSLSocket.getEnabledCipherSuites 的 sha1(握手前 Java API 配置列表;Android/Conscrypt 版本恒定=全设备一样→跨身份恒定属预期非聚集锚)" jLayer {
+                    val s = javax.net.ssl.SSLSocketFactory.getDefault().createSocket() as javax.net.ssl.SSLSocket
+                    val list = try { s.enabledCipherSuites.joinToString(",") } finally { runCatching { s.close() } }
+                    java.security.MessageDigest.getInstance("SHA-1").digest(list.toByteArray())
+                        .joinToString("") { "%02x".format(it) }
+                },
+            )
+            field("tls.enabled_protocols_javaapi",
+                "SSLSocket.getEnabledProtocols(Java API,版本恒定)" jLayer {
+                    val s = javax.net.ssl.SSLSocketFactory.getDefault().createSocket() as javax.net.ssl.SSLSocket
+                    try { s.enabledProtocols.joinToString(",") } finally { runCatching { s.close() } }
+                },
+            )
+        }
+
+        // ============================================================
         // R. APP 清单变量(Phase H,图 4 — 黑产工具识别)
         //    商业 SDK 探测黑产工具类 app 是否安装,直接判定用户类型
         //    Android 11+ 包可见性需要 <queries> 声明,getPackageInfo 会抛
