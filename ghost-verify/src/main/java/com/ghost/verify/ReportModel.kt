@@ -445,6 +445,63 @@ object CrossFieldChecker {
         }
 
         // ============================================================
+        // hw 组:CPU/SoC/厂商 一致性(farm 硬件真身泄漏)
+        // ============================================================
+        // (A) MANUFACTURER ↔ BRAND 同 OEM:SHARP 厂商配 motorola 品牌 = 设备档案错值/字段混搭
+        run {
+            val mfg = oemGroup(map["MANUFACTURER"]?.canonicalValue)
+            val brand = oemGroup(map["BRAND"]?.canonicalValue)
+            if (mfg != null && brand != null && mfg != brand) {
+                violations += CrossFieldViolation(
+                    ruleName = "MANUFACTURER_VS_BRAND", severity = "high",
+                    fields = listOf("MANUFACTURER", "BRAND", "MODEL"),
+                    values = mapOf(
+                        "MANUFACTURER" to map["MANUFACTURER"]?.canonicalValue,
+                        "BRAND" to map["BRAND"]?.canonicalValue,
+                        "MODEL" to map["MODEL"]?.canonicalValue),
+                    expected = "Build.MANUFACTURER 与 BRAND 应属同一 OEM 组",
+                    note = "厂商组=$mfg 品牌组=$brand 矛盾:真机不可能(如 SHARP 厂商+motorola 品牌)=设备档案错值/字段混搭"
+                )
+            }
+        }
+        // (B) ro.board.platform 厂商 ↔ SOC_MODEL 厂商:gs101(Tensor)配 SM7550(高通)=SoC 真身泄漏
+        run {
+            val platVendor = socVendorFromPlatform(map["ro.board.platform"]?.canonicalValue)
+            val socVendor = socVendorFromModel(map["SOC_MODEL"]?.canonicalValue)
+            if (platVendor != null && socVendor != null && platVendor != socVendor) {
+                violations += CrossFieldViolation(
+                    ruleName = "SOC_PLATFORM_VENDOR_MISMATCH", severity = "high",
+                    fields = listOf("ro.board.platform", "SOC_MODEL"),
+                    values = mapOf(
+                        "ro.board.platform" to map["ro.board.platform"]?.canonicalValue,
+                        "SOC_MODEL" to map["SOC_MODEL"]?.canonicalValue),
+                    expected = "ro.board.platform 平台厂商应与 SOC_MODEL 厂商一致",
+                    note = "平台厂商=$platVendor SoC厂商=$socVendor 矛盾:ghost 未 spoof ro.board.platform,真 SoC 泄漏"
+                )
+            }
+        }
+        // (C) /proc/cpuinfo CPU 微架构 ↔ SOC_MODEL:含旗舰 prime 核但 SoC 为中端 = 真旗舰 CPU 泄漏
+        run {
+            val parts = (map["cpuinfo.CPUParts"]?.canonicalValue ?: "")
+                .split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
+            // 仅 Cortex-X 系(旗舰独占超大核):X1/X2/X3/X4/X925。★剔除 A76(0xd0b)/A710(0xd47)——它们是大量中端 SoC
+            //   的主力大核(骁龙7Gen1=A710、骁龙730=A76、天玑700/810=A76),含它们会把合法中端真机误判 farm(误报危害>漏报)。
+            val flagshipPrime = setOf("0xd44", "0xd48", "0xd4e", "0xd82", "0xd85") // X1,X2,X3,X4,X925
+            val prime = parts.filter { it in flagshipPrime }
+            if (prime.isNotEmpty() && socTierFromModel(map["SOC_MODEL"]?.canonicalValue) == "mid") {
+                violations += CrossFieldViolation(
+                    ruleName = "CPU_ARCH_VS_SOC_TIER", severity = "high",
+                    fields = listOf("cpuinfo.CPUParts", "SOC_MODEL", "MODEL"),
+                    values = mapOf(
+                        "cpuinfo.CPUParts" to map["cpuinfo.CPUParts"]?.canonicalValue,
+                        "SOC_MODEL" to map["SOC_MODEL"]?.canonicalValue,
+                        "MODEL" to map["MODEL"]?.canonicalValue),
+                    expected = "cpuinfo 旗舰 prime 核(X1/X2/X3/X4/A76)不应出现在中端 SoC 型号下",
+                    note = "cpuinfo 含旗舰核 $prime 但 SOC_MODEL=${map["SOC_MODEL"]?.canonicalValue}(中端)=真旗舰 CPU 冒充中端型号=farm(如真 Tensor 冒充 SM7550)"
+                )
+            }
+        }
+        // ============================================================
         // network 组:NetworkInterface 真洞 + Wifi/DHCP IP 链 + hasTransport
         // ============================================================
         // 从字段值里抽第一个非 0.0.0.0 的 IPv4;抽不到(<none>/<null>/<denied>)返 null 不参与比对
@@ -933,6 +990,67 @@ object CrossFieldChecker {
         }
 
         return violations
+    }
+
+    /** 型号/厂商字符串 → 规范 OEM 组;未知返 null(不参与,避免误报)。 */
+    private fun oemGroup(s: String?): String? {
+        val v = s?.trim()?.lowercase() ?: return null
+        if (v.isEmpty()) return null
+        return when {
+            v.contains("motorola") || v == "moto" || v.contains("lenovo") -> "motorola"
+            v.contains("google") || v.contains("pixel") -> "google"
+            v.contains("samsung") -> "samsung"
+            v.contains("xiaomi") || v.contains("redmi") || v.contains("poco") -> "xiaomi"
+            v.contains("oppo") || v.contains("realme") || v.contains("oneplus") -> "bbk"
+            v.contains("vivo") || v.contains("iqoo") -> "vivo"
+            v.contains("huawei") || v.contains("honor") -> "huawei"
+            v.contains("sharp") -> "sharp"
+            v.contains("sony") -> "sony"
+            v.contains("asus") -> "asus"
+            v.contains("nubia") || v.contains("zte") -> "zte"
+            v.contains("infinix") || v.contains("tecno") || v.contains("itel") -> "transsion"
+            v.contains("nothing") -> "nothing"
+            else -> null
+        }
+    }
+
+    /** ro.board.platform 平台代号 → SoC 厂商;未知返 null。 */
+    private fun socVendorFromPlatform(s: String?): String? {
+        val v = s?.trim()?.lowercase() ?: return null
+        if (v.isEmpty()) return null
+        return when {
+            v.startsWith("gs") || v.startsWith("zuma") -> "google"           // gs101/gs201/zuma = Tensor
+            v.startsWith("exynos") || v.startsWith("s5e") || v.startsWith("universal") -> "samsung"
+            v.startsWith("mt") -> "mediatek"
+            v.startsWith("sm") || v.startsWith("sdm") || v.startsWith("msm") || v.startsWith("qcom") ||
+                v in setOf("kalama", "taro", "lahaina", "pineapple", "sun", "bengal", "holi", "parrot",
+                    "kona", "lito", "atoll", "trinket", "msmnile", "cape", "waipio", "ukee", "canoe") -> "qualcomm"
+            else -> null
+        }
+    }
+
+    /** SOC_MODEL(如 SM7550 / MT6983 / Tensor)→ SoC 厂商;未知返 null。 */
+    private fun socVendorFromModel(s: String?): String? {
+        val v = s?.trim()?.uppercase() ?: return null
+        if (v.isEmpty()) return null
+        return when {
+            v.startsWith("SM") || v.startsWith("SDM") || v.startsWith("MSM") || v.startsWith("QCS") ||
+                v.startsWith("APQ") -> "qualcomm"
+            v.startsWith("MT") -> "mediatek"
+            v.startsWith("EXYNOS") || v.startsWith("S5E") -> "samsung"
+            v.startsWith("TENSOR") || v.startsWith("GS") || v.contains("GOOGLE") -> "google"
+            v.startsWith("KIRIN") -> "huawei"
+            else -> null
+        }
+    }
+
+    /** SOC_MODEL → 档次 flagship/mid;判不了返 null。高通 SM8xxx=旗舰,SM7/6/4xxx=中低。 */
+    private fun socTierFromModel(s: String?): String? {
+        val v = s?.trim()?.uppercase() ?: return null
+        Regex("SM(\\d)").find(v)?.let { return if (it.groupValues[1].toInt() >= 8) "flagship" else "mid" }
+        Regex("SDM(\\d)").find(v)?.let { return if (it.groupValues[1].toInt() >= 8) "flagship" else "mid" }
+        Regex("MT(\\d{4})").find(v)?.let { return if (it.groupValues[1].toInt() >= 6983) "flagship" else "mid" }
+        return null
     }
 
     private fun checkAllEqualString(

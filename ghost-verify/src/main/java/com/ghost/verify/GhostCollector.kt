@@ -778,6 +778,21 @@ class GhostCollector(private val context: Context) {
                     NativeBridge.readFile("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq", 64).trim()
                 },
             )
+            // CPU 微架构签名:所有不同的 "CPU part"(0xd05=A55, 0xd0b=A76, 0xd44=X1 …)。
+            // 这是硬件真值(ghost 若不 spoof /proc/cpuinfo 就暴露真 SoC),用于跨字段比对声称的 SOC_MODEL。
+            field("cpuinfo.CPUParts",
+                "proc cpuinfo" pLayer { extractAllProcValues("/proc/cpuinfo", "CPU part") },
+            )
+            field("cpuinfo.CPUImplementer",
+                "proc cpuinfo" pLayer { extractAllProcValues("/proc/cpuinfo", "CPU implementer") },
+            )
+            // ro.board.platform:SoC 平台真值(gs101=Tensor, kalama/taro/pineapple=高通, mt6xxx=联发科)。
+            field("ro.board.platform",
+                "getprop" sLayer { getpropShell("ro.board.platform") },
+            )
+            field("ro.hardware.chipname",
+                "getprop" sLayer { getpropShell("ro.hardware.chipname") },
+            )
         }
 
         // ============================================================
@@ -2770,6 +2785,28 @@ class GhostCollector(private val context: Context) {
                     "visible=${vis.size}/${peers.size} | not-visible=[${hid.joinToString(",")}]"
                 },
             )
+            // ★sensitive_pkg_visibility:从 scoped(被 hook)caller 视角,逐个 getPackageInfo 探测【无条件敏感包】——
+            //   RE/root/hook/抓包/自动化/隐秘相机/attestation 检查器,它们在任何 farm 设备上对风控 caller 都【绝不该可见】,
+            //   任一 visible = 隐藏机制漏洞。★不含 farm 社交(twitter/whatsapp/ins…)——那些在自己模拟设备上本就应可见,
+            //   混进来会假阳性(其可见性正确性由邻近 app.peer_visible 按 per-device 不变量单独判)。
+            field("app.sensitive_pkg_visibility",
+                "getPackageInfo(无条件敏感/工具包) scoped-caller 视角;visible=隐藏漏洞" jLayer {
+                    val probe = listOf(
+                        // RE / root / hook / 抓包 / 自动化 工具
+                        "com.reqable.android", "com.sukisu.ultra", "org.auto.auto.v6", "org.x.manager",
+                        "io.github.vvb2060.keyattestation", "io.github.vvb2060.mahoshojo",
+                        "io.liankong.riskdetector", "com.reveny.nativecheck", "com.apkpure.aegon",
+                        // 隐秘相机 / 偷拍类
+                        "com.weixikeji.privatecameraV2",
+                    )
+                    val pm = context.packageManager
+                    val vis = probe.filter {
+                        runCatching { pm.getPackageInfo(it, 0); true }.getOrDefault(false)
+                    }
+                    if (vis.isEmpty()) "clean (0 visible)"
+                    else "★LEAK: ${vis.size} visible=[${vis.joinToString(",")}]"
+                },
+            )
             // ★visible_list_hash:可见非系统 app 列表的稳定 hash → 跨两次一键新机对比应【不同】(反聚类),
             //   同一 identity 内多次采集应【相同】(稳定)。
             field("app.visible_list_hash",
@@ -3577,6 +3614,17 @@ class GhostCollector(private val context: Context) {
             ?.substringAfter(":")
             ?.trim()
             ?: ""
+    }
+
+    /** 抽取某前缀所有行的值,去重排序,逗号连接(如 /proc/cpuinfo 的全部 "CPU part")。 */
+    private fun extractAllProcValues(path: String, prefix: String): String {
+        val content = NativeBridge.readFile(path, 65536)
+        return content.lineSequence()
+            .filter { it.trimStart().startsWith(prefix) }
+            .map { it.substringAfter(":").trim() }
+            .filter { it.isNotEmpty() }
+            .toSortedSet()
+            .joinToString(",")
     }
 
     private val ENV_KEYWORDS = listOf(
