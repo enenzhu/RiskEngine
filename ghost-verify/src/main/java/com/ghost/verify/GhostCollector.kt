@@ -1080,6 +1080,28 @@ class GhostCollector(private val context: Context) {
                 "Locale.getDefault().toLanguageTag()" jLayer { Locale.getDefault().toLanguageTag() },
                 "persist.sys.locale" nLayer { NativeBridge.getSystemProperty("persist.sys.locale") },
             )
+            // ★system_locales / locale_list:风控(如 Castle)读的 locale 列表。应与 locale/persist.sys.locale 一致;
+            //   若声称地区(如 jp)却漏出用户真实语言列表(如 en-US,zh-HK)= 穿帮。
+            field("system_locales",
+                "Settings.System.system_locales" jLayer {
+                    android.provider.Settings.System.getString(context.contentResolver, "system_locales") ?: "<null>"
+                },
+            )
+            field("locale_list",
+                "LocaleList.getDefault().toLanguageTags()" jLayer {
+                    android.os.LocaleList.getDefault().toLanguageTags()
+                },
+            )
+            // ★config_locales:Castle(io.castle.highwind)native VM 走 Configuration.getLocales() 拿的 tag27 源。
+            //   与 locale_list(LocaleList.getDefault)是不同 API,必须单独探。声称 jp 却漏 en-US,zh-HK = 穿帮。
+            field("config_locales",
+                "Resources.getSystem().getConfiguration().getLocales()" jLayer {
+                    android.content.res.Resources.getSystem().configuration.locales.toLanguageTags()
+                },
+                "context.resources.configuration.getLocales()" jLayer {
+                    context.resources.configuration.locales.toLanguageTags()
+                },
+            )
             field("ro.build.description",
                 "ro.build.description" nLayer { NativeBridge.getSystemProperty("ro.build.description") },
             )
