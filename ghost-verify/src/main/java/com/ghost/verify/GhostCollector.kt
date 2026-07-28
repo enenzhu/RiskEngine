@@ -35,6 +35,8 @@ class GhostCollector(private val context: Context) {
 
     fun collectAll(): CollectReport {
         fields.clear()
+        // KeystoreCryptoProbe 的 RSA(KeyPairGeneratorSpec)需要 Context;在任何探针调用前注入。
+        KeystoreCryptoProbe.appContext = context.applicationContext
 
         // ============================================================
         // A. Build 类静态字段(ghost BuildHook 改的字段)
@@ -1337,11 +1339,57 @@ class GhostCollector(private val context: Context) {
             field("crypto.gcm_tag_length_ok",
                 "GCM 密文长度==明文+16(tag)?(false=无tag=空加密)" jLayer { KeystoreCryptoProbe.gcmTagLengthOk().toString() },
             )
-            // ★K9:非认证 EC keygen 公钥 SHA-256(ghost 固定内嵌→跨设备/新机同=锚;真机应 per-device 唯一+跨新机变)。
+            // ★K9:非认证 EC keygen 公钥 SHA-256。
+            //   旧 ghost:固定内嵌密钥 → 跨设备/新机相同 = 聚集锚(被 X Castle 等抓)。
+            //   本次改动:每设备派生 → 跨设备应**不同**、同设备确定性相同、跨新机应变(= 聚集锚已消除)。
             field("keystore.nonattest_ec_pubkey_sha256",
-                "非 challenge EC keygen 公钥 SHA-256(跨设备比对:相同=ghost 固定密钥锚)" jLayer {
+                "非 challenge EC keygen 公钥 SHA-256(跨设备应不同=per-device 生效;相同=仍固定锚)" jLayer {
                     KeystoreCryptoProbe.nonAttestEcPubKeySha256()
                 },
+            )
+            // ★RSA(PRIVATE_RSA,no-op 加密)同会话往返 —— 验证惰性 RSA 派生 + 自签名占位证书可用。
+            field("crypto.rsa_self_roundtrip_ok",
+                "RSA encrypt(pubkey)→decrypt(privkey)==canary(惰性派生+自签名证书)" jLayer {
+                    KeystoreCryptoProbe.rsaSelfRoundTripOk().toString()
+                },
+            )
+            // ★EC(PRIVATE_EC,真签名)同会话 sign→verify —— 验证每设备派生 EC 密钥 + 自签名证书可签可验。
+            field("crypto.ec_sign_verify_ok",
+                "EC sign(privkey)→verify(pubkey)(每设备派生密钥+自签名证书)" jLayer {
+                    KeystoreCryptoProbe.ecSignVerifyOk().toString()
+                },
+            )
+            // ★★缓存优先(参照真 app SharedPrefUtils):密文/签名存 SharedPreferences 随备份走 →
+            //   还原/新机后解缓存的密文=直接验证备份还原保真。cache ok=true=保真;seeded=本次首播种。
+            //   AES(常量seed)跨设备恒解;RSA(no-op)恒解;EC(per-device)同设备/还原过、跨新机变。
+            field("crypto.aes_cached_decrypt",
+                "AES 解缓存密文(备份还原保真;cache=用缓存/seeded=本次播种)" jLayer {
+                    KeystoreCryptoProbe.aesCachedDecrypt().toString()
+                },
+            )
+            field("crypto.rsa_cached_decrypt",
+                "RSA 解缓存密文(no-op 恒可移植)" jLayer {
+                    KeystoreCryptoProbe.rsaCachedDecrypt().toString()
+                },
+            )
+            field("crypto.ec_cached_verify",
+                "EC 验缓存签名(同设备/还原应过、跨新机应变)" jLayer {
+                    KeystoreCryptoProbe.ecCachedVerify().toString()
+                },
+            )
+            // ★getCertificate 与 getCertificateChain 一致性 —— 验证本次新增的 getCertificateChain hook:
+            //   两者都应非 null、链长=1、subject=CN=Fake(AOSP 非 attestation 默认);cert 非 null 而 chain==null=穿帮。
+            field("keystore.cert_chain_consistency",
+                "getCertificate vs getCertificateChain 一致(链长=1、CN=Fake)" jLayer {
+                    KeystoreCryptoProbe.certChainConsistency()
+                },
+            )
+            // RSA/EC 公钥指纹(聚集锚:跨设备应不同、同设备确定性相同、跨新机应变)。
+            field("keystore.xdev_rsa_pubkey_sha256",
+                "备份用 RSA 公钥 SHA-256(跨设备应不同)" jLayer { KeystoreCryptoProbe.rsaPubKeyHash() },
+            )
+            field("keystore.xdev_ec_pubkey_sha256",
+                "备份用 EC 公钥 SHA-256(跨设备应不同)" jLayer { KeystoreCryptoProbe.ecPubKeyHash() },
             )
         }
 

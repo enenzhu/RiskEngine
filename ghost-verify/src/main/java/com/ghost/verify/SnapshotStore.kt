@@ -49,6 +49,15 @@ object SnapshotStore {
         val apps: Map<String, String>,        // pkg → "firstInstall|lastUpdate|apkMtime"
         val cryptoCipherHex: String? = null,  // ★Keystore AES/GCM(canary) 密文(随备份走 → 还原后用当前密钥解 = 跨设备解密测试)
         val cryptoIvHex: String? = null,
+        // ★RSA(no-op 加密):密文随备份走,还原后用当前设备 RSA 密钥解 == canary ?(老备份能解)
+        val rsaCipherB64: String? = null,
+        // ★EC(真签名):签名 + 原文随备份走;EC 是真密钥相关,还原后用当前 EC 公钥验签
+        //   —— 同设备(确定性密钥)应验过;跨设备/新机(per-device 密钥)验不过=预期。
+        val ecSignedData: String? = null,
+        val ecSignatureB64: String? = null,
+        // 聚集锚:公钥指纹(同设备 restore 应相同;跨新机应变=per-device 反聚集生效)
+        val ecPubKeyHash: String? = null,
+        val rsaPubKeyHash: String? = null,
     )
 
     /** 从采集报告 + app 列表抽出快照(身份字段 + app 时间三元组 + Keystore 跨设备解密密文)。 */
@@ -63,7 +72,17 @@ object SnapshotStore {
             apps[pkg] = "${a["firstInstall"]}|${a["lastUpdate"]}|${a["apkMtime"]}"
         }
         val enc = KeystoreCryptoProbe.encrypt(KeystoreCryptoProbe.CANARY)
-        return Snapshot(report.deviceLabel, report.timestampHuman, f, apps, enc?.first, enc?.second)
+        val rsaEnc = KeystoreCryptoProbe.rsaEncrypt(KeystoreCryptoProbe.CANARY)
+        val ecSig = KeystoreCryptoProbe.ecSign(KeystoreCryptoProbe.CANARY)
+        return Snapshot(
+            report.deviceLabel, report.timestampHuman, f, apps,
+            cryptoCipherHex = enc?.first, cryptoIvHex = enc?.second,
+            rsaCipherB64 = rsaEnc,
+            ecSignedData = if (ecSig != null) KeystoreCryptoProbe.CANARY else null,
+            ecSignatureB64 = ecSig,
+            ecPubKeyHash = KeystoreCryptoProbe.ecPubKeyHash(),
+            rsaPubKeyHash = KeystoreCryptoProbe.rsaPubKeyHash(),
+        )
     }
 
     private fun file(context: Context) = File(context.filesDir, FILE)
@@ -88,9 +107,15 @@ object SnapshotStore {
         val fieldMismatches: List<String>,   // "name: baseline=X vs current=Y"
         val appsMissing: List<String>,       // 备份时有、现在没有(还原漏装/漏记录)
         val appsChanged: List<String>,       // 时间三元组变了(installTime/mtime 没还原对 → 归因穿帮)
-        val crossDeviceDecrypt: String? = null,  // ★用当前设备密钥解 baseline 密文:ok/fail/null(无 baseline 密文)
+        val crossDeviceDecrypt: String? = null,  // ★AES:用当前设备密钥解 baseline 密文:ok/fail/null(无 baseline 密文)
+        val rsaCrossDecrypt: String? = null,     // ★RSA(no-op):同上
+        val ecCrossVerify: String? = null,       // ★EC(真签名):用当前公钥验 baseline 签名
+        val pubKeyDelta: String? = null,         // 公钥指纹 baseline vs current(same=同密钥 / diff=per-device 变了)
     ) {
         val ok: Boolean get() = hadBaseline && sameDeviceLabel && fieldMismatches.isEmpty() && appsMissing.isEmpty() && appsChanged.isEmpty()
+        // 加解密结论(与身份/app 的 restore-diff 分开):AES+RSA 是 no-op 加密,必须 ok;EC 是真签名,不纳入硬性 ok。
+        val cryptoOk: Boolean get() =
+            (crossDeviceDecrypt?.startsWith("✅") != false) && (rsaCrossDecrypt?.startsWith("✅") != false)
         fun summary(): String = when {
             !hadBaseline -> "restore-diff: 无 baseline 快照(首次采集,已写入;备份→还原后再采即可验证)"
             ok -> "✅ restore-diff: 当前设备 == baseline 快照($baselineLabel @$baselineTime)—— 身份字段 + app 列表全一致,还原成功"
@@ -101,7 +126,15 @@ object SnapshotStore {
                 if (appsMissing.isNotEmpty()) append("  还原后缺失的 app(${appsMissing.size}): ${appsMissing.take(20)}\n")
                 if (appsChanged.isNotEmpty()) append("  app 时间三元组变了(installTime/mtime 没还原对=归因穿帮风险)(${appsChanged.size}): ${appsChanged.take(20)}\n")
             }
-        }.let { base -> if (crossDeviceDecrypt != null) "$base\n  🔐 Keystore 跨设备解密: $crossDeviceDecrypt" else base }
+        }.let { base ->
+            val crypto = buildString {
+                if (crossDeviceDecrypt != null) append("\n  🔐 AES 跨设备解密: $crossDeviceDecrypt")
+                if (rsaCrossDecrypt != null)   append("\n  🔐 RSA 跨设备解密: $rsaCrossDecrypt")
+                if (ecCrossVerify != null)     append("\n  ✍️ EC 跨设备验签: $ecCrossVerify")
+                if (pubKeyDelta != null)       append("\n  🔑 公钥指纹: $pubKeyDelta")
+            }
+            base + crypto
+        }
     }
 
     /** baseline(上次/还原带回)vs current(本次 fresh)对比。 */
@@ -122,6 +155,36 @@ object SnapshotStore {
             if (dec == KeystoreCryptoProbe.CANARY) "✅ ok(baseline 密文用当前设备密钥解开=canary,跨设备解密成功→加密数据可移植)"
             else "❌ fail(解不出/不匹配:${dec ?: "null"})—— Keystore 密钥没跨设备移植,farm app 会丢加密 token/登录态"
         } else null
+        // ★RSA(no-op 加密):与 AES 同理,密文与密钥值无关 → 老备份必须能解。
+        val rsaXdev = baseline.rsaCipherB64?.let { c ->
+            val dec = KeystoreCryptoProbe.rsaDecrypt(c)
+            if (dec == KeystoreCryptoProbe.CANARY) "✅ ok(baseline RSA 密文用当前设备私钥解开=canary → 老备份能解)"
+            else "❌ fail(解不出/不匹配:${dec ?: "null"})—— RSA no-op 断了,老备份加密数据解不开"
+        }
+        // ★EC(真签名,密钥相关):用当前 EC 公钥验 baseline 签名。按**公钥是否变了**判读(比设备标签准):
+        //   - 验过 → EC 密钥与 baseline 相同,签名可移植。
+        //   - 验不过 + 公钥变了 → 预期:EC 密钥变了(旧固定→新每设备派生 的转换,或跨新机),旧签名自然验不过;非加解密回归。
+        //   - 验不过 + 公钥没变 → 真异常(公钥相同却验不过,疑签名/验签实现问题)。
+        val ecKeyChanged = baseline.ecPubKeyHash != null && current.ecPubKeyHash != null &&
+            baseline.ecPubKeyHash != current.ecPubKeyHash
+        val ecX = if (baseline.ecSignatureB64 != null && baseline.ecSignedData != null) {
+            val okv = KeystoreCryptoProbe.ecVerify(baseline.ecSignedData, baseline.ecSignatureB64)
+            when {
+                okv -> "✅ verify ok(旧签名用当前 EC 公钥验过 → EC 密钥与 baseline 相同,签名可移植)"
+                ecKeyChanged -> "⚠ verify fail 且 EC 公钥已变 → **预期**(EC 是真签名;密钥旧固定→新每设备派生 或 跨新机 → 旧签名不可验;非加解密回归)"
+                else -> "❌ verify fail 但 EC 公钥未变 → 异常(公钥相同却验不过,疑签名/验签实现问题)"
+            }
+        } else null
+        // 公钥指纹对比(same=同一密钥;diff=密钥变了)。
+        val pkDelta = if (baseline.ecPubKeyHash != null || baseline.rsaPubKeyHash != null) {
+            fun d(name: String, b: String?, c: String?): String = when {
+                b == null || c == null -> "$name=?(缺)"
+                b == c -> "$name=same(${b.take(12)}…)"
+                else -> "$name=DIFF(baseline ${b.take(12)}… vs current ${c.take(12)}…)"
+            }
+            d("ec", baseline.ecPubKeyHash, current.ecPubKeyHash) + " " +
+                d("rsa", baseline.rsaPubKeyHash, current.rsaPubKeyHash)
+        } else null
         return RestoreDiff(
             hadBaseline = true,
             baselineLabel = baseline.deviceLabel,
@@ -131,6 +194,9 @@ object SnapshotStore {
             appsMissing = appsMissing,
             appsChanged = appsChanged,
             crossDeviceDecrypt = xdev,
+            rsaCrossDecrypt = rsaXdev,
+            ecCrossVerify = ecX,
+            pubKeyDelta = pkDelta,
         )
     }
 }
