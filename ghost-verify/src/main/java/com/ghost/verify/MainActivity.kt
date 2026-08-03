@@ -165,10 +165,17 @@ class MainActivity : AppCompatActivity() {
     private fun runCollection() {
         tvSummary.text = "采集中..."
         btnCollect.isEnabled = false
+        val collectionReferrer = referrer?.toString()
+        val hasExplicitReferrer = intent?.hasExtra(Intent.EXTRA_REFERRER) == true ||
+            intent?.hasExtra(Intent.EXTRA_REFERRER_NAME) == true
         thread {
             val t0 = System.currentTimeMillis()
             // 1) ghost-verify 自己的多路径一致性采集
-            val ghostReport = GhostCollector(applicationContext).collectAll()
+            val ghostReport = GhostCollector(
+                applicationContext,
+                collectionReferrer,
+                hasExplicitReferrer,
+            ).collectAll()
             val ghostCost = System.currentTimeMillis() - t0
 
             // 2) RiskEngine SDK 全量采集(fingerprint + 检测器结果)
@@ -378,6 +385,20 @@ class MainActivity : AppCompatActivity() {
                 else null
             "env.pms_direct_sensitive_pkgs" ->
                 if (v != "clean") "🚨 direct getPackageInfo 能看到敏感包" else null
+            // === 云真机桌面暴露面 ===
+            "cloud.home_resolved" -> when {
+                v.contains("com.tt.hi") -> "🚨 默认 HOME 暴露 Ghost"
+                v == "<none>" -> "⚠ 默认 HOME 无法解析"
+                else -> null
+            }
+            "cloud.home_candidates" ->
+                if (v.contains("com.tt.hi")) "🚨 HOME 枚举暴露 Ghost" else null
+            "cloud.ghost_package_visible" ->
+                if (v == "true") "🚨 PackageManager 可直接看到 Ghost" else null
+            "cloud.launch_referrer" ->
+                if (v.contains("com.tt.hi")) "🚨 Activity referrer 暴露 Ghost" else null
+            "cloud.launch_identity_consistency" ->
+                if (v.startsWith("MISMATCH")) "🚨 启动来源与目标 App 所见 HOME 不一致" else null
             // === 安装列表 spoof 攻防面板 ===
             "applist.brand_match" ->
                 if (v.startsWith("MISSING")) "🚨 品牌不符:列表无 OEM 包" else null

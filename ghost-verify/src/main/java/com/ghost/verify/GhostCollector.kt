@@ -29,7 +29,11 @@ import java.util.TimeZone
  * 一致性: 同字段不同路径 value 集合去重后 ≤ 1 个就 consistent;否则就是 ghost spoof
  *         漏了某条路径,会在 JSON 报告里标 ❌。
  */
-class GhostCollector(private val context: Context) {
+class GhostCollector(
+    private val context: Context,
+    private val launchReferrer: String? = null,
+    private val launchReferrerExplicit: Boolean = false,
+) {
 
     private val fields = mutableListOf<FieldResult>()
 
@@ -2720,6 +2724,68 @@ class GhostCollector(private val context: Context) {
         }
 
         // ============================================================
+        // Q. 云真机桌面暴露面
+        //   目标 app 应看到原 OEM HOME、看不到 Ghost 包；从云桌面点击启动时，公开
+        //   Activity.getReferrer() 也必须与其看到的 HOME 包一致，不能泄漏 com.tt.hi。
+        // ============================================================
+        category("cloud-phone") {
+            val pm = context.packageManager
+            val homeIntent = android.content.Intent(android.content.Intent.ACTION_MAIN)
+                .addCategory(android.content.Intent.CATEGORY_HOME)
+            val resolvedHome = runCatching {
+                pm.resolveActivity(homeIntent, 0)?.activityInfo?.let {
+                    android.content.ComponentName(it.packageName, it.name).flattenToShortString()
+                }
+            }.getOrNull()
+            val resolvedHomePackage = resolvedHome?.substringBefore('/')
+            val homeCandidates = runCatching {
+                pm.queryIntentActivities(homeIntent, 0)
+                    .mapNotNull { it.activityInfo?.let { ai -> "${ai.packageName}/${ai.name}" } }
+                    .distinct()
+                    .sorted()
+            }.getOrElse { emptyList() }
+            val ghostVisible = runCatching {
+                pm.getPackageInfo(GHOST_PACKAGE, 0)
+                true
+            }.getOrDefault(false)
+            val referrerPackage = launchReferrer?.let {
+                runCatching { android.net.Uri.parse(it).authority }.getOrNull()
+            }
+
+            field("cloud.home_resolved",
+                "PackageManager.resolveActivity(MAIN+HOME)" jLayer {
+                    resolvedHome ?: "<none>"
+                },
+            )
+            field("cloud.home_candidates",
+                "PackageManager.queryIntentActivities(MAIN+HOME)" jLayer {
+                    if (homeCandidates.isEmpty()) "<none>" else homeCandidates.joinToString(",")
+                },
+            )
+            field("cloud.ghost_package_visible",
+                "PackageManager.getPackageInfo(com.tt.hi)" jLayer { ghostVisible.toString() },
+            )
+            field("cloud.launch_referrer",
+                "Activity.getReferrer() captured before background collection" jLayer {
+                    launchReferrer ?: "<none>"
+                },
+            )
+            field("cloud.launch_identity_consistency",
+                "referrer authority == resolved HOME package" jLayer {
+                    when {
+                        !launchReferrerExplicit -> "not-tested(no explicit launch referrer)"
+                        launchReferrer == null -> "MISMATCH explicit referrer=<none>"
+                        resolvedHomePackage == null ->
+                            "MISMATCH home=<none> referrer=${referrerPackage ?: launchReferrer}"
+                        referrerPackage == resolvedHomePackage -> "ok ($resolvedHomePackage)"
+                        else ->
+                            "MISMATCH home=$resolvedHomePackage referrer=${referrerPackage ?: launchReferrer}"
+                    }
+                },
+            )
+        }
+
+        // ============================================================
         // R. APP 清单变量(Phase H,图 4 — 黑产工具识别)
         //    商业 SDK 探测黑产工具类 app 是否安装,直接判定用户类型
         //    Android 11+ 包可见性需要 <queries> 声明,getPackageInfo 会抛
@@ -3627,6 +3693,11 @@ class GhostCollector(private val context: Context) {
     // DSL helpers
     // ========================================================================
     private var currentCategory: String = "default"
+
+    companion object {
+        private const val GHOST_PACKAGE = "com.tt.hi"
+    }
+
     private fun category(name: String, block: () -> Unit) {
         currentCategory = name
         block()
