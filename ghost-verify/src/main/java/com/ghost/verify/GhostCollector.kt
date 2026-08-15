@@ -3903,35 +3903,10 @@ class GhostCollector(
 
     private val WIDEVINE_UUID = java.util.UUID.fromString("EDEF8BA9-79D6-4ACE-A3C8-27DCD51D21ED")
 
-    // ★DRM 探针专用超时线程池:MediaDrm(WIDEVINE) 构造会走 vendor Widevine DRM HAL 的 binder;
-    //   当该 HAL 被 TrickyStore WidevineInterceptor 挂死(见 memory project_trickstore_widevine_hal_wedge_pixel4)
-    //   时会永久死等,拖死整条 collectAll → 报告永不产出。放到独立 daemon 线程 + get(timeout),
-    //   超时返回 <timeout> 让采集继续。★只包 MediaDrm(binder,搬线程安全);GL 等线程绑定探针不能搬。
-    //   ★超时不 interrupt(cancel(false)):卡在 native binder 的线程被 interrupt 会 SIGSEGV;
-    //   daemon 线程泄漏挂着无害(进程照退)。
-    private val drmExecutor: java.util.concurrent.ExecutorService =
-        java.util.concurrent.Executors.newCachedThreadPool { r ->
-            Thread(r, "gv-drm").apply { isDaemon = true }
-        }
-    private val drmTimeoutMs = 5000L
-
-    private fun drmWithTimeout(block: () -> String): String {
-        val f = drmExecutor.submit(java.util.concurrent.Callable { block() })
-        return try {
-            f.get(drmTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
-        } catch (te: java.util.concurrent.TimeoutException) {
-            f.cancel(false)
-            "<timeout> DRM HAL 无响应(${drmTimeoutMs}ms)"
-        } catch (t: Throwable) {
-            val cause = (t as? java.util.concurrent.ExecutionException)?.cause ?: t
-            "<error> ${cause.javaClass.simpleName}"
-        }
-    }
-
     /** Widevine deviceUniqueId — DRM 层硬件 ID,base64 后输出 */
     @SuppressLint("HardwareIds")
-    private fun widevineDeviceId(): String = drmWithTimeout {
-        try {
+    private fun widevineDeviceId(): String {
+        return try {
             val drm = android.media.MediaDrm(WIDEVINE_UUID)
             val bytes = drm.getPropertyByteArray("deviceUniqueId")
             drm.close()
@@ -3941,8 +3916,8 @@ class GhostCollector(
         }
     }
 
-    private fun widevineProperty(key: String): String = drmWithTimeout {
-        try {
+    private fun widevineProperty(key: String): String {
+        return try {
             val drm = android.media.MediaDrm(WIDEVINE_UUID)
             val v = drm.getPropertyString(key)
             drm.close()

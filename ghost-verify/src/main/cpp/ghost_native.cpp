@@ -16,9 +16,11 @@
 #include <cstdio>
 #include <cstring>
 #include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <sys/utsname.h>
 #include <sys/system_properties.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <EGL/egl.h>
@@ -279,6 +281,41 @@ static inline long raw_syscall6(long n, long a, long b, long c, long d, long e, 
     return syscall(n, a, b, c, d, e, f);
 }
 #endif
+
+// ============================================================
+// getClockSnapshot: libc 与 raw svc 双路径读取内核 uptime。
+// Java 层只改 SystemClock 时，这些独立路径会形成明确的不一致证据。
+// ============================================================
+extern "C" JNIEXPORT jlongArray JNICALL
+Java_com_ghost_verify_NativeBridge_getClockSnapshot(JNIEnv* env, jclass) {
+    jlong values[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+
+    const clockid_t clock_ids[] = {CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_RAW};
+    for (int i = 0; i < 3; ++i) {
+        struct timespec libc_ts {};
+        if (clock_gettime(clock_ids[i], &libc_ts) == 0) {
+            values[i * 2] = static_cast<jlong>(libc_ts.tv_sec) * 1000000000LL + libc_ts.tv_nsec;
+        }
+
+        struct timespec raw_ts {};
+        if (raw_syscall6(SYS_clock_gettime, static_cast<long>(clock_ids[i]),
+                         reinterpret_cast<long>(&raw_ts), 0, 0, 0, 0) == 0) {
+            values[i * 2 + 1] = static_cast<jlong>(raw_ts.tv_sec) * 1000000000LL + raw_ts.tv_nsec;
+        }
+    }
+
+    struct sysinfo libc_info {};
+    if (sysinfo(&libc_info) == 0) values[6] = libc_info.uptime;
+
+    struct sysinfo raw_info {};
+    if (raw_syscall6(SYS_sysinfo, reinterpret_cast<long>(&raw_info), 0, 0, 0, 0, 0) == 0) {
+        values[7] = raw_info.uptime;
+    }
+
+    jlongArray result = env->NewLongArray(8);
+    if (result != nullptr) env->SetLongArrayRegion(result, 0, 8, values);
+    return result;
+}
 
 // ============================================================
 // readFileViaSyscall: 完全用 raw svc syscall 读文件(绕 libc)

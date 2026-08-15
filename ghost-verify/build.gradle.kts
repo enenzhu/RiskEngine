@@ -34,7 +34,8 @@ android {
             isMinifyEnabled = false
         }
         debug {
-            isDebuggable = true
+            // verifier 本身不能因为 debug flag 被 RiskEngine 直接判高危；仍使用 debug 签名便于 adb 覆盖安装。
+            isDebuggable = false
         }
     }
 
@@ -66,4 +67,5 @@ dependencies {
     // OkHttp 走 HTTP/2 拿 peet.ws 返回的 akamai_fingerprint(Java HttpsURLConnection 只 h1)
     implementation(libs.okhttp)
     implementation(project(":riskengine-sdk"))
+    testImplementation(libs.junit)
 }

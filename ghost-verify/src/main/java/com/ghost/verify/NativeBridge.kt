@@ -33,6 +33,13 @@ object NativeBridge {
     /** 同 statFile,但走 svc #0 调 __NR_newfstatat 绕过 libc hook */
     external fun statFileViaSyscall(path: String): String
 
+    /**
+     * 返回 libc 与 raw svc 两组时钟/uptime，顺序为:
+     * BOOTTIME(ns), raw BOOTTIME(ns), MONOTONIC(ns), raw MONOTONIC(ns),
+     * MONOTONIC_RAW(ns), raw MONOTONIC_RAW(ns), sysinfo uptime(s), raw sysinfo uptime(s)。
+     */
+    external fun getClockSnapshot(): LongArray
+
     /** 直接 fopen,绕过 Java IO 抽象。maxBytes 默认 64KB */
     external fun readFile(path: String, maxBytes: Int = 65536): String
 

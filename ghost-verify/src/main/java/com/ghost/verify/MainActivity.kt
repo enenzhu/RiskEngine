@@ -129,16 +129,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ★gv 已在前台时再 am start --es auto collect 会走 onNewIntent 而非 onCreate,
-    //   补此处理避免脚本化重触发"必须先 force-stop 才采集"。
-    override fun onNewIntent(intent: Intent?) {
-        super.onNewIntent(intent)
-        setIntent(intent)
-        if (intent?.getStringExtra("auto") == "collect") {
-            btnCollect.post { runCollection() }
-        }
-    }
-
     private fun ensureStoragePermission() {
         // Android 11+ 优先 MANAGE_EXTERNAL_STORAGE,否则 fallback 到 legacy WRITE
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {

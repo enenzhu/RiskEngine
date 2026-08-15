@@ -17,6 +17,11 @@
     <!-- Phase H: 指纹硬件检测 -->
     <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.USE_FINGERPRINT" />
+    <!-- 相机只读取 CameraCharacteristics，不打开预览/拍照。Android 12+ 无 CAMERA 时 ID 可能被裁剪。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.camera.any" android:required="false" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
     <!-- Phase H: app-presence 黑产 app 探测,Android 11+ 需要 QUERY_ALL_PACKAGES -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />

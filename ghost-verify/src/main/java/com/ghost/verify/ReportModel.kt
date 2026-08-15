@@ -50,8 +50,119 @@ data class CollectReport(
     val fieldCount: Int,
     val inconsistentCount: Int,
     val fields: List<FieldResult>,
-    val crossFieldViolations: List<CrossFieldViolation> = emptyList()
+    val crossFieldViolations: List<CrossFieldViolation> = emptyList(),
+    /**
+     * 跨报告聚集性信号。单份报告只记录“风控能看到什么”;是否跨新机复用同一物理锚，
+     * 由 tools/compare_clustering_reports.py 在显式 physical/identity 分组下判定。
+     */
+    val clusteringSignals: List<ClusteringSignal> = emptyList(),
 )
+
+/** 风控用于跨报告归并设备的稳定信号。 */
+data class ClusteringSignal(
+    val name: String,
+    /** identity=应随一键新机变;family=硬件家族;physical_candidate=疑似具体物理机锚;dynamic=仅作时序证据。 */
+    val scope: String,
+    val severity: String,
+    val sourceField: String,
+    val value: String?,
+    val available: Boolean,
+    /** 数值信号跨采集允许的绝对误差;hash/string 为 null。 */
+    val numericTolerance: Double? = null,
+    val rationale: String,
+)
+
+/**
+ * 把现有字段映射成稳定的聚集性信号。定义集中在这里，避免比较脚本猜字段含义。
+ */
+object ClusteringSignalCatalog {
+    private data class Def(
+        val name: String,
+        val field: String,
+        val scope: String,
+        val severity: String,
+        val tolerance: Double? = null,
+        val rationale: String,
+    )
+
+    private val definitions = listOf(
+        // 应随虚拟身份轮换的 ID。重复即直接串身份。
+        Def("identity.boot_id", "boot_id", "identity", "high",
+            rationale = "kernel boot_id 应随虚拟身份轮换"),
+        Def("identity.android_id", "ANDROID_ID", "identity", "high",
+            rationale = "同一 app 的 ANDROID_ID 不应跨虚拟身份复用"),
+        Def("identity.gsf_android_id", "GSF Android ID", "identity", "high",
+            rationale = "GSF Android ID 是 Google 设备归并锚"),
+        Def("identity.widevine_device_id", "Widevine.deviceUniqueId", "identity", "high",
+            rationale = "Widevine deviceUniqueId 是高熵硬件 DRM 锚"),
+        Def("identity.keystore_ec_pubkey", "keystore.xdev_ec_pubkey_sha256", "identity", "high",
+            rationale = "EC 公钥指纹应按虚拟身份派生"),
+        Def("identity.keystore_rsa_pubkey", "keystore.xdev_rsa_pubkey_sha256", "identity", "high",
+            rationale = "RSA 公钥指纹应按虚拟身份派生"),
+
+        // 具体物理机候选锚:需同物理跨身份 + 不同物理同型号 A/B 才能确认。
+        Def("physical.boot_epoch_raw", "uptime.boot_epoch_raw_s", "physical_candidate", "high", 3.0,
+            "raw CLOCK_BOOTTIME 推导的真实开机 epoch;跨身份不变说明 uptime 未隔离"),
+        Def("physical.proc_stat_btime", "uptime.proc_stat_btime_s", "physical_candidate", "high", 1.0,
+            "/proc/stat btime 是独立开机时间旁路"),
+        Def("physical.camera_calibration", "camera.calibration_sha256", "physical_candidate", "high",
+            rationale = "镜头内参/畸变/姿态/颜色校准可能包含单机校准差异"),
+        Def("physical.sensor_ids", "sensor.ids_sha256", "physical_candidate", "high",
+            rationale = "Sensor.getId() 文档承诺同 app 到恢复出厂前稳定"),
+
+        // 家族锚:如果不同目标型号仍相同，说明共同露出 Pixel 6 物理家族。
+        Def("family.cpu_policy", "cpu.policy_static_sha256", "family", "high",
+            rationale = "cpufreq policy/频率表/driver 组合可识别 Tensor/Pixel 6 家族"),
+        Def("family.camera_topology", "camera.topology_sha256", "family", "high",
+            rationale = "camera ID/能力/焦距/sensor/stream map 组合是相机模组家族锚"),
+        Def("family.camera_info_version", "camera.info_version_sha256", "family", "medium",
+            rationale = "camera HAL/ISP version 可识别固件家族"),
+        Def("family.sensor_topology", "sensor.topology_sha256", "family", "high",
+            rationale = "sensor type/wakeup/reporting/private type 拓扑可识别 Pixel 家族"),
+        Def("family.sensor_metadata", "sensor.metadata_sha256", "family", "high",
+            rationale = "完整 sensor 元组比仅 name/vendor 更能归并设备家族"),
+        Def("family.sensor_private_types", "sensor.private_types_sha256", "family", "high",
+            rationale = "OEM 私有 sensor type/stringType 是强家族标记"),
+        Def("family.features_versioned", "features.versioned_sha256", "family", "medium",
+            rationale = "包含 version/GLES 的完整 feature 表可形成稳定设备画像"),
+        Def("family.nfc_profile", "nfc.profile_sha256", "family", "low",
+            rationale = "NFC/HCE/eSE/UICC 能力组合是低熵家族特征"),
+        Def("family.memory_profile", "memory.static_profile_sha256", "family", "low",
+            rationale = "RAM/heap/lowRam 组合用于自洽，单独熵较低"),
+
+        // 时序证据不能做 exact-equal 聚集判定，只保留给人工/统计分析。
+        Def("dynamic.sensor_events", "sensor.event_stats", "dynamic", "medium",
+            rationale = "静置条件下的 bias/noise 可用于后续单机指纹统计"),
+        Def("dynamic.cpu_cur_freq", "cpu.policy_cur_freq_samples", "dynamic", "low",
+            rationale = "当前频率用于判断静态伪造，不应跨报告 exact compare"),
+        Def("dynamic.meminfo", "memory.meminfo_samples", "dynamic", "medium",
+            rationale = "连续样本用于发现冻结 meminfo"),
+    )
+
+    fun build(fields: List<FieldResult>): List<ClusteringSignal> {
+        val byName = fields.associateBy { it.name }
+        return definitions.map { d ->
+            val value = byName[d.field]?.canonicalValue?.takeIf(::isMeaningful)
+            ClusteringSignal(
+                name = d.name,
+                scope = d.scope,
+                severity = d.severity,
+                sourceField = d.field,
+                value = value,
+                available = value != null,
+                numericTolerance = d.tolerance,
+                rationale = d.rationale,
+            )
+        }
+    }
+
+    private fun isMeaningful(value: String): Boolean {
+        val v = value.trim().lowercase()
+        return v.isNotEmpty() &&
+            v !in setOf("0", "null", "unknown", "unavailable", "<null>", "<unavailable>") &&
+            !v.startsWith("<denied") && !v.startsWith("<error")
+    }
+}
 
 /** 跨字段一致性规则引擎。 */
 object CrossFieldChecker {
@@ -464,23 +575,43 @@ object CrossFieldChecker {
                 )
             }
         }
-        // (B) ro.board.platform 厂商 ↔ SOC_MODEL 厂商:gs101(Tensor)配 SM7550(高通)=SoC 真身泄漏
+        // (B) 进程内 __system_property_get 与 Runtime.exec(getprop) 必须同源。后者若返回物理值，
+        // 说明只拦了当前进程的 property API，子进程路径仍可绕过。
         run {
-            val platVendor = socVendorFromPlatform(map["ro.board.platform"]?.canonicalValue)
+            val nativePlatform = map["ro.board.platform"]?.canonicalValue
+            val shellPlatform = map["ro.board.platform.shell_getprop"]?.canonicalValue
+            if (!nativePlatform.isNullOrBlank() && !shellPlatform.isNullOrBlank() &&
+                !nativePlatform.equals(shellPlatform, ignoreCase = true)) {
+                violations += CrossFieldViolation(
+                    ruleName = "BOARD_PLATFORM_NATIVE_VS_SHELL", severity = "high",
+                    fields = listOf("ro.board.platform", "ro.board.platform.shell_getprop"),
+                    values = mapOf(
+                        "ro.board.platform.native" to nativePlatform,
+                        "ro.board.platform.shell_getprop" to shellPlatform),
+                    expected = "进程内 property API 与 Runtime.exec(getprop) 应返回同一 ro.board.platform",
+                    note = "普通 SDK 可启动 getprop 子进程绕过进程内 property hook，直接读出物理 SoC 平台"
+                )
+            }
+        }
+        // (C) 可见 ro.board.platform 厂商 ↔ SOC_MODEL 厂商:gs101(Tensor)配 SM7550(高通)=SoC 真身泄漏
+        run {
+            val observedPlatform = map["ro.board.platform.shell_getprop"]?.canonicalValue
+                ?: map["ro.board.platform"]?.canonicalValue
+            val platVendor = socVendorFromPlatform(observedPlatform)
             val socVendor = socVendorFromModel(map["SOC_MODEL"]?.canonicalValue)
             if (platVendor != null && socVendor != null && platVendor != socVendor) {
                 violations += CrossFieldViolation(
                     ruleName = "SOC_PLATFORM_VENDOR_MISMATCH", severity = "high",
-                    fields = listOf("ro.board.platform", "SOC_MODEL"),
+                    fields = listOf("ro.board.platform.shell_getprop", "ro.board.platform", "SOC_MODEL"),
                     values = mapOf(
-                        "ro.board.platform" to map["ro.board.platform"]?.canonicalValue,
+                        "ro.board.platform.observed" to observedPlatform,
                         "SOC_MODEL" to map["SOC_MODEL"]?.canonicalValue),
                     expected = "ro.board.platform 平台厂商应与 SOC_MODEL 厂商一致",
-                    note = "平台厂商=$platVendor SoC厂商=$socVendor 矛盾:ghost 未 spoof ro.board.platform,真 SoC 泄漏"
+                    note = "平台厂商=$platVendor SoC厂商=$socVendor 矛盾:可见路径泄漏真 SoC"
                 )
             }
         }
-        // (C) /proc/cpuinfo CPU 微架构 ↔ SOC_MODEL:含旗舰 prime 核但 SoC 为中端 = 真旗舰 CPU 泄漏
+        // (D) /proc/cpuinfo CPU 微架构 ↔ SOC_MODEL:含旗舰 prime 核但 SoC 为中端 = 真旗舰 CPU 泄漏
         run {
             val parts = (map["cpuinfo.CPUParts"]?.canonicalValue ?: "")
                 .split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
@@ -985,6 +1116,322 @@ object CrossFieldChecker {
                     values = mapOf("Widevine.securityLevel" to wvLevel, "tee.attestation_security_level" to attLevel),
                     expected = "Widevine L1(硬件 DRM)⇒ keystore 应硬件支持(TEE/StrongBox)",
                     note = "L1 硬件 DRM 依赖 TEE/TrustZone,但 keystore attestation 报 Software(无硬件)=自相矛盾锚"
+                )
+            }
+        }
+
+        // === 风控 SDK 对抗:FeatureInfo 的 version 契约不能只伪造“存在” ===
+        run {
+            val versionViolations = map["features.version_contract_violation_count"]?.canonicalValue?.toIntOrNull()
+            if (versionViolations != null && versionViolations > 0) {
+                violations += CrossFieldViolation(
+                    ruleName = "FEATURE_VERSION_CONTRACT_BROKEN", severity = "high",
+                    fields = listOf("features.version_contract_violation_count", "features.version_contract_violations"),
+                    values = mapOf(
+                        "features.version_contract_violation_count" to versionViolations.toString(),
+                        "features.version_contract_violations" to map["features.version_contract_violations"]?.canonicalValue,
+                    ),
+                    expected = "FeatureInfo.version 与 hasSystemFeature(name, version) 查询结果必须一致",
+                    note = "只替换 feature 名称集合、没有同步 version 查询语义，会被普通 PackageManager API 交叉验证识别",
+                )
+            }
+
+            val acceptsMax = map["features.accepts_int_max_count"]?.canonicalValue?.toIntOrNull()
+            if (acceptsMax != null && acceptsMax > 0) {
+                violations += CrossFieldViolation(
+                    ruleName = "FEATURE_ACCEPTS_IMPOSSIBLE_VERSION", severity = "high",
+                    fields = listOf("features.accepts_int_max_count", "features.accepts_int_max_names"),
+                    values = mapOf(
+                        "features.accepts_int_max_count" to acceptsMax.toString(),
+                        "features.accepts_int_max_names" to map["features.accepts_int_max_names"]?.canonicalValue,
+                    ),
+                    expected = "hasSystemFeature(name, Int.MAX_VALUE) 必须为 false",
+                    note = "忽略 version 参数并恒返 true 是明确的 framework hook 痕迹",
+                )
+            }
+
+            val named = map["features.named_count"]?.canonicalValue?.toIntOrNull()
+            val gles = map["features.gles_entry_count"]?.canonicalValue?.toIntOrNull()
+            if (named != null && named > 0 && gles == 0) {
+                violations += CrossFieldViolation(
+                    ruleName = "FEATURE_GLES_ENTRY_MISSING", severity = "medium",
+                    fields = listOf("features.named_count", "features.gles_entry_count", "GL_VERSION"),
+                    values = mapOf(
+                        "features.named_count" to named.toString(),
+                        "features.gles_entry_count" to "0",
+                        "GL_VERSION" to map["GL_VERSION"]?.canonicalValue,
+                    ),
+                    expected = "完整 systemAvailableFeatures 通常包含 name=null 的 reqGlEsVersion 条目",
+                    note = "整表替换时漏掉 GLES FeatureInfo，会暴露人工构造的 feature 列表",
+                )
+            }
+        }
+
+        // === 风控 SDK 对抗:Java/libc/raw svc/proc 四路 uptime 必须是同一时钟域 ===
+        run {
+            fun long(name: String) = map[name]?.canonicalValue?.toLongOrNull()
+            fun addClockMismatch(rule: String, left: String, right: String, toleranceMs: Long, note: String) {
+                val a = long(left) ?: return
+                val b = long(right) ?: return
+                val delta = kotlin.math.abs(a - b)
+                if (delta > toleranceMs) {
+                    violations += CrossFieldViolation(
+                        ruleName = rule, severity = "high",
+                        fields = listOf(left, right),
+                        values = mapOf(left to a.toString(), right to b.toString(), "delta_ms" to delta.toString()),
+                        expected = "两条 uptime 路径误差应 ≤ ${toleranceMs}ms",
+                        note = note,
+                    )
+                }
+            }
+            addClockMismatch(
+                "UPTIME_JAVA_VS_RAW_BOOTTIME", "uptime.java_elapsed_ms", "uptime.native_boottime_raw_ms", 5_000,
+                "Java SystemClock 与 raw svc CLOCK_BOOTTIME 不同域，说明只在 Java/framework 层改了开机时间",
+            )
+            addClockMismatch(
+                "UPTIME_LIBC_VS_RAW_BOOTTIME", "uptime.native_boottime_libc_ms", "uptime.native_boottime_raw_ms", 1_000,
+                "libc clock_gettime 与直接 svc 结果不一致，说明 native hook 可被 raw syscall 绕过",
+            )
+            addClockMismatch(
+                "UPTIME_LIBC_VS_RAW_MONOTONIC", "uptime.native_monotonic_libc_ms", "uptime.native_monotonic_raw_ms", 1_000,
+                "libc CLOCK_MONOTONIC 与直接 svc 结果不一致，说明 native hook 可被 raw syscall 绕过",
+            )
+            addClockMismatch(
+                "UPTIME_LIBC_VS_RAW_MONOTONIC_RAW", "uptime.native_monotonic_raw_libc_ms", "uptime.native_monotonic_raw_svc_ms", 1_000,
+                "libc CLOCK_MONOTONIC_RAW 与直接 svc 结果不一致，说明 native hook 可被 raw syscall 绕过",
+            )
+            addClockMismatch(
+                "UPTIME_PROC_VS_RAW_BOOTTIME", "uptime.proc_uptime_ms", "uptime.native_boottime_raw_ms", 5_000,
+                "/proc/uptime 与 raw CLOCK_BOOTTIME 不一致，说明伪造路径没有覆盖到同一内核时间源",
+            )
+
+            val sysinfoLibc = long("uptime.sysinfo_libc_s")
+            val sysinfoRaw = long("uptime.sysinfo_raw_s")
+            if (sysinfoLibc != null && sysinfoRaw != null && kotlin.math.abs(sysinfoLibc - sysinfoRaw) > 1) {
+                violations += CrossFieldViolation(
+                    ruleName = "UPTIME_SYSINFO_LIBC_VS_RAW", severity = "high",
+                    fields = listOf("uptime.sysinfo_libc_s", "uptime.sysinfo_raw_s"),
+                    values = mapOf(
+                        "uptime.sysinfo_libc_s" to sysinfoLibc.toString(),
+                        "uptime.sysinfo_raw_s" to sysinfoRaw.toString(),
+                        "delta_s" to kotlin.math.abs(sysinfoLibc - sysinfoRaw).toString(),
+                    ),
+                    expected = "libc sysinfo 与 raw svc sysinfo uptime 误差应 ≤ 1s",
+                    note = "libc sysinfo hook 可被 raw syscall 绕过",
+                )
+            }
+
+            val rawEpoch = long("uptime.boot_epoch_raw_s")
+            val btime = long("uptime.proc_stat_btime_s")
+            if (rawEpoch != null && btime != null && kotlin.math.abs(rawEpoch - btime) > 10) {
+                violations += CrossFieldViolation(
+                    ruleName = "BOOT_EPOCH_RAW_VS_PROC_BTIME", severity = "high",
+                    fields = listOf("uptime.boot_epoch_raw_s", "uptime.proc_stat_btime_s"),
+                    values = mapOf(
+                        "uptime.boot_epoch_raw_s" to rawEpoch.toString(),
+                        "uptime.proc_stat_btime_s" to btime.toString(),
+                        "delta_s" to kotlin.math.abs(rawEpoch - btime).toString(),
+                    ),
+                    expected = "wall-clock - raw CLOCK_BOOTTIME 与 /proc/stat btime 应指向同一开机 epoch(容差 10s)",
+                    note = "两条独立开机时间旁路矛盾，是 uptime 随机化不完整的强信号",
+                )
+            }
+
+            val sensorDelta = long("sensor.event_timestamp_delta_abs_max_ms")
+            if (sensorDelta != null && sensorDelta > 5_000) {
+                violations += CrossFieldViolation(
+                    ruleName = "SENSOR_TIMESTAMP_VS_ELAPSED_REALTIME", severity = "high",
+                    fields = listOf("sensor.event_timestamp_delta_abs_max_ms", "uptime.java_elapsed_nanos_ms"),
+                    values = mapOf(
+                        "sensor.event_timestamp_delta_abs_max_ms" to sensorDelta.toString(),
+                        "uptime.java_elapsed_nanos_ms" to map["uptime.java_elapsed_nanos_ms"]?.canonicalValue,
+                    ),
+                    expected = "SensorEvent.timestamp 与 elapsedRealtimeNanos 应处于同一时钟域",
+                    note = "Java uptime 随机但 sensor HAL 时间戳未同步时，会出现秒级以上偏差",
+                )
+            }
+        }
+
+        // === Camera/NFC/Sensor 声明与真实 service 能力交叉验证 ===
+        run {
+            fun bool(name: String) = map[name]?.canonicalValue?.toBooleanStrictOrNull()
+            fun int(name: String) = map[name]?.canonicalValue?.toIntOrNull()
+            fun addBooleanMismatch(rule: String, feature: String, actual: String, note: String) {
+                val advertised = bool(feature) ?: return
+                val observed = bool(actual) ?: return
+                if (advertised != observed) {
+                    violations += CrossFieldViolation(
+                        ruleName = rule, severity = "high",
+                        fields = listOf(feature, actual),
+                        values = mapOf(feature to advertised.toString(), actual to observed.toString()),
+                        expected = "$feature 与 $actual 必须一致",
+                        note = note,
+                    )
+                }
+            }
+
+            val cameraFeature = bool("feature.has.camera")
+            val cameraCount = int("camera.count")
+            if (cameraFeature != null && cameraCount != null && cameraFeature != (cameraCount > 0)) {
+                violations += CrossFieldViolation(
+                    ruleName = "CAMERA_FEATURE_VS_SERVICE", severity = "high",
+                    fields = listOf("feature.has.camera", "camera.count", "camera.permission_granted"),
+                    values = mapOf(
+                        "feature.has.camera" to cameraFeature.toString(),
+                        "camera.count" to cameraCount.toString(),
+                        "camera.permission_granted" to map["camera.permission_granted"]?.canonicalValue,
+                    ),
+                    expected = "声明 camera feature 时 CameraManager 至少应枚举到一颗相机，反之亦然",
+                    note = "PackageManager feature 表与 camera service 拓扑不同源",
+                )
+            }
+            addBooleanMismatch("CAMERA_FULL_FEATURE_VS_CAPABILITY", "feature.has.camera_level_full", "camera.capability.any_full",
+                "声明 FULL camera feature 与 CameraCharacteristics hardware level 不一致")
+            addBooleanMismatch("CAMERA_RAW_FEATURE_VS_CAPABILITY", "feature.has.camera_raw", "camera.capability.any_raw",
+                "声明 RAW camera feature 与 REQUEST_AVAILABLE_CAPABILITIES_RAW 不一致")
+            addBooleanMismatch("CAMERA_MANUAL_FEATURE_VS_CAPABILITY", "feature.has.camera_manual_sensor", "camera.capability.any_manual_sensor",
+                "声明 manual-sensor feature 与 REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR 不一致")
+
+            val concurrentFeature = bool("feature.has.camera_concurrent")
+            val concurrentSets = int("camera.concurrent_set_count")
+            if (concurrentFeature != null && concurrentSets != null && concurrentFeature != (concurrentSets > 0)) {
+                violations += CrossFieldViolation(
+                    ruleName = "CAMERA_CONCURRENT_FEATURE_VS_SERVICE", severity = "high",
+                    fields = listOf("feature.has.camera_concurrent", "camera.concurrent_set_count"),
+                    values = mapOf(
+                        "feature.has.camera_concurrent" to concurrentFeature.toString(),
+                        "camera.concurrent_set_count" to concurrentSets.toString(),
+                    ),
+                    expected = "concurrent camera feature 与 CameraManager.concurrentCameraIds 必须一致",
+                    note = "feature 表声明了目标机能力，但底层 camera provider 仍是物理机拓扑",
+                )
+            }
+
+            addBooleanMismatch("NFC_FEATURE_VS_ADAPTER", "feature.has.nfc", "nfc.adapter_present",
+                "NFC feature 与 NfcAdapter service 是否存在不一致")
+            addBooleanMismatch("BAROMETER_FEATURE_VS_SENSOR", "feature.has.sensor_barometer", "sensor.actual.pressure",
+                "barometer feature 与 SensorManager 压力传感器拓扑不一致")
+
+            val googlePrivate = int("sensor.google_private_marker_count")
+            val claimedOem = oemGroup(map["MANUFACTURER"]?.canonicalValue)
+            if (googlePrivate != null && googlePrivate > 0 && claimedOem != null && claimedOem != "google") {
+                violations += CrossFieldViolation(
+                    ruleName = "PIXEL_PRIVATE_SENSOR_ON_NON_GOOGLE_TARGET", severity = "high",
+                    fields = listOf("sensor.google_private_marker_count", "sensor.private_types_profile", "MANUFACTURER", "MODEL"),
+                    values = mapOf(
+                        "sensor.google_private_marker_count" to googlePrivate.toString(),
+                        "sensor.private_types_profile" to map["sensor.private_types_profile"]?.canonicalValue,
+                        "MANUFACTURER" to map["MANUFACTURER"]?.canonicalValue,
+                        "MODEL" to map["MODEL"]?.canonicalValue,
+                    ),
+                    expected = "非 Google 目标档案不应暴露 Pixel/Google 私有 sensor 类型或名称",
+                    note = "这类 OEM 私有 sensor 是 Pixel 6 物理家族聚集锚",
+                )
+            }
+
+            val cpuPolicy = map["cpu.policy_static_profile"]?.canonicalValue.orEmpty().lowercase()
+            val claimedSocVendor = map["SOC_MANUFACTURER"]?.canonicalValue.orEmpty().lowercase()
+            val pixelGovernorLeak = "sched_pixel" in cpuPolicy && claimedOem != null && claimedOem != "google"
+            val exynosDriverMismatch = "exynos_cpufreq" in cpuPolicy &&
+                claimedSocVendor.isNotBlank() &&
+                !claimedSocVendor.contains("google") &&
+                !claimedSocVendor.contains("samsung") &&
+                !claimedSocVendor.contains("exynos")
+            if (pixelGovernorLeak || exynosDriverMismatch) {
+                violations += CrossFieldViolation(
+                    ruleName = "CPU_POLICY_PIXEL_FAMILY_LEAK", severity = "high",
+                    fields = listOf("cpu.policy_static_profile", "MANUFACTURER", "MODEL", "SOC_MANUFACTURER"),
+                    values = mapOf(
+                        "cpu.policy_marker" to listOfNotNull(
+                            "sched_pixel".takeIf { pixelGovernorLeak },
+                            "exynos_cpufreq".takeIf { exynosDriverMismatch },
+                        ).joinToString(","),
+                        "MANUFACTURER" to map["MANUFACTURER"]?.canonicalValue,
+                        "MODEL" to map["MODEL"]?.canonicalValue,
+                        "SOC_MANUFACTURER" to map["SOC_MANUFACTURER"]?.canonicalValue,
+                    ),
+                    expected = "非 Google/Exynos 目标不应暴露 sched_pixel 或 exynos_cpufreq",
+                    note = "cpufreq driver/governor 是普通 app 可读的 Pixel/Tensor 物理家族锚",
+                )
+            }
+        }
+
+        // === /proc/meminfo 与 ActivityManager:静态总量同源，动态值不能被冻结/瞬移 ===
+        run {
+            val procTotalKb = map["memory.proc_total_kb"]?.canonicalValue?.toLongOrNull()
+            val amTotalKb = map["memory.am_total_kb"]?.canonicalValue?.toLongOrNull()
+            if (procTotalKb != null && amTotalKb != null) {
+                val delta = kotlin.math.abs(procTotalKb - amTotalKb)
+                val tolerance = maxOf(64L * 1024L, procTotalKb / 50L)
+                if (delta > tolerance) {
+                    violations += CrossFieldViolation(
+                        ruleName = "MEMTOTAL_PROC_VS_ACTIVITY_MANAGER", severity = "high",
+                        fields = listOf("memory.proc_total_kb", "memory.am_total_kb"),
+                        values = mapOf(
+                            "memory.proc_total_kb" to procTotalKb.toString(),
+                            "memory.am_total_kb" to amTotalKb.toString(),
+                            "delta_kb" to delta.toString(),
+                        ),
+                        expected = "ActivityManager.totalMem 与 /proc/meminfo MemTotal 差异应 ≤ max(64MiB, 2%)",
+                        note = "只改 /proc/meminfo 或只改 framework MemoryInfo 会形成稳定的内存伪造证据",
+                    )
+                }
+
+                val availDelta = map["memory.am_proc_avail_max_delta_kb"]?.canonicalValue?.toLongOrNull()
+                val availTolerance = maxOf(1024L * 1024L, minOf(procTotalKb, amTotalKb) / 4L)
+                if (availDelta != null && availDelta > availTolerance) {
+                    violations += CrossFieldViolation(
+                        ruleName = "MEMAVAILABLE_PROC_VS_ACTIVITY_MANAGER", severity = "medium",
+                        fields = listOf("memory.am_proc_avail_max_delta_kb", "memory.proc_total_kb"),
+                        values = mapOf(
+                            "memory.am_proc_avail_max_delta_kb" to availDelta.toString(),
+                            "memory.proc_total_kb" to procTotalKb.toString(),
+                        ),
+                        expected = "ActivityManager.availMem 与 MemAvailable 不应长期相差超过 max(1GiB, 25% RAM)",
+                        note = "两者口径并非逐字节相等，因此这里只标记大幅偏离为中风险",
+                    )
+                }
+
+                val maxStepKb = map["memory.am_avail_max_step_kb"]?.canonicalValue?.toLongOrNull()
+                if (maxStepKb != null && maxStepKb > amTotalKb / 4L) {
+                    violations += CrossFieldViolation(
+                        ruleName = "MEMAVAILABLE_IMPLAUSIBLE_JUMP", severity = "medium",
+                        fields = listOf("memory.am_avail_max_step_kb", "memory.proc_total_kb"),
+                        values = mapOf(
+                            "memory.am_avail_max_step_kb" to maxStepKb.toString(),
+                            "memory.proc_total_kb" to procTotalKb.toString(),
+                        ),
+                        expected = "100ms 内 availMem 通常不应跳变超过 ActivityManager 总 RAM 的 25%",
+                        note = "大进程释放内存也可能触发，因此单次只记中风险；跨报告复现再确认随机伪造",
+                    )
+                }
+            }
+
+            val thresholdUnique = map["memory.am_threshold_unique_count"]?.canonicalValue?.toIntOrNull()
+            if (thresholdUnique != null && thresholdUnique > 1) {
+                violations += CrossFieldViolation(
+                    ruleName = "MEMORYINFO_THRESHOLD_UNSTABLE", severity = "high",
+                    fields = listOf("memory.am_threshold_unique_count", "memory.am_samples"),
+                    values = mapOf(
+                        "memory.am_threshold_unique_count" to thresholdUnique.toString(),
+                        "memory.am_samples" to map["memory.am_samples"]?.canonicalValue,
+                    ),
+                    expected = "同一进程连续调用 ActivityManager.getMemoryInfo 时 low-memory threshold 应保持稳定",
+                    note = "逐次随机生成 MemoryInfo 会让系统阈值也跟着变化，是普通 SDK 可重复验证的 hook 痕迹",
+                )
+            }
+
+            val procUnique = map["memory.meminfo_unique_dynamic_count"]?.canonicalValue?.toIntOrNull()
+            if (procUnique == 1) {
+                violations += CrossFieldViolation(
+                    ruleName = "MEMINFO_DYNAMIC_VALUES_FROZEN", severity = "medium",
+                    fields = listOf("memory.meminfo_unique_dynamic_count", "memory.meminfo_samples"),
+                    values = mapOf(
+                        "memory.meminfo_unique_dynamic_count" to "1",
+                        "memory.meminfo_samples" to map["memory.meminfo_samples"]?.canonicalValue,
+                    ),
+                    expected = "连续三次 /proc/meminfo 的多项动态计数通常会有至少一项变化",
+                    note = "200ms 窗口仍可能偶发静止，需多份报告复现后再判定，不单独作为发布阻断",
                 )
             }
         }
