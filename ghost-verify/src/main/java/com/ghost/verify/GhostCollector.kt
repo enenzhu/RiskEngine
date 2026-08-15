@@ -750,6 +750,7 @@ class GhostCollector(
                 "/proc/sys/kernel/osrelease" pLayer { NativeBridge.readFile("/proc/sys/kernel/osrelease", 256).trim() },
                 "ro.kernel.version" nLayer { NativeBridge.getSystemProperty("ro.kernel.version") },
                 "System.getProperty('os.version')" jLayer { System.getProperty("os.version") ?: "" },
+                "popen uname -r" nLayer { NativeBridge.execShell("uname -r", 512).trim() },
             )
             field("uname.version",
                 "native uname()" nLayer { uname.getOrNull(3) ?: "" },
@@ -792,8 +793,9 @@ class GhostCollector(
             field("cpuinfo.CPUImplementer",
                 "proc cpuinfo" pLayer { extractAllProcValues("/proc/cpuinfo", "CPU implementer") },
             )
-            // ro.board.platform:SoC 平台真值(gs101=Tensor, kalama/taro/pineapple=高通, mt6xxx=联发科)。
-            field("ro.board.platform",
+            // Runtime.exec(getprop) 是独立于进程内 __system_property_get 的读取路径。字段必须与上面的
+            // native ro.board.platform 分开命名，否则 CrossFieldChecker.associateBy 会静默覆盖其中一条。
+            field("ro.board.platform.shell_getprop",
                 "getprop" sLayer { getpropShell("ro.board.platform") },
             )
             field("ro.hardware.chipname",
@@ -3246,13 +3248,8 @@ class GhostCollector(
         // X.4 — popen 命令探测(模拟风控走 execve/popen 绕过)
         // 文章原文:"很多大厂会执行 popen logcat / getprop / uname -a / ip a / ps -ef / df grep magisk"
         category("popen-probes") {
-            // uname.release 是核心字段(spoof 后 ghost 改 syscall uname → release 跟着改)
-            // syscall release + popen uname -r 都应该返回同样的 release 字符串(归一化对比);
+            // uname -r 已并入 kernel/uname.release，与 native/proc/property/Java 五路同字段比较。
             // /proc/version Android 11+ 受 SELinux 限制普通 app 读不到 = 预期空,不参与一致性
-            field("uname.release",
-                "syscall uname().release" nLayer { NativeBridge.getUname().getOrNull(2) ?: "" },
-                "popen uname -r" nLayer { NativeBridge.execShell("uname -r", 512).trim() },
-            )
             // 单独字段记录,不强制比对
             field("uname.full_uname_a",
                 "popen uname -a" nLayer { NativeBridge.execShell("uname -a", 512).trim() },
@@ -3671,12 +3668,20 @@ class GhostCollector(
             )
         }
 
+        // 风控 SDK 视角的物理机/家族聚集性探针。只读 framework、/proc、/sys，
+        // 不把跨报告结论硬编码进单份报告；由显式 physical/identity 分组工具判定。
+        ClusteringProbe.collect(context).forEach { probe ->
+            fields += FieldResult.build(probe.name, probe.category, probe.sources)
+        }
+
         // ============================================================
         // 收尾 — 构建 report
         // ============================================================
         val timestamp = System.currentTimeMillis()
         val ts = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date(timestamp))
-        val crossViolations = CrossFieldChecker.run(fields.toList())
+        val fieldSnapshot = fields.toList()
+        val crossViolations = CrossFieldChecker.run(fieldSnapshot)
+        val clusteringSignals = ClusteringSignalCatalog.build(fieldSnapshot)
         return CollectReport(
             timestamp = timestamp,
             timestampHuman = ts,
@@ -3684,8 +3689,9 @@ class GhostCollector(
             deviceLabel = "${Build.MANUFACTURER}/${Build.MODEL} (${Build.DEVICE})",
             fieldCount = fields.size,
             inconsistentCount = fields.count { !it.consistent } + crossViolations.size,
-            fields = fields.toList(),
-            crossFieldViolations = crossViolations
+            fields = fieldSnapshot,
+            crossFieldViolations = crossViolations,
+            clusteringSignals = clusteringSignals,
         )
     }
 
@@ -3897,10 +3903,35 @@ class GhostCollector(
 
     private val WIDEVINE_UUID = java.util.UUID.fromString("EDEF8BA9-79D6-4ACE-A3C8-27DCD51D21ED")
 
+    // ★DRM 探针专用超时线程池:MediaDrm(WIDEVINE) 构造会走 vendor Widevine DRM HAL 的 binder;
+    //   当该 HAL 被 TrickyStore WidevineInterceptor 挂死(见 memory project_trickstore_widevine_hal_wedge_pixel4)
+    //   时会永久死等,拖死整条 collectAll → 报告永不产出。放到独立 daemon 线程 + get(timeout),
+    //   超时返回 <timeout> 让采集继续。★只包 MediaDrm(binder,搬线程安全);GL 等线程绑定探针不能搬。
+    //   ★超时不 interrupt(cancel(false)):卡在 native binder 的线程被 interrupt 会 SIGSEGV;
+    //   daemon 线程泄漏挂着无害(进程照退)。
+    private val drmExecutor: java.util.concurrent.ExecutorService =
+        java.util.concurrent.Executors.newCachedThreadPool { r ->
+            Thread(r, "gv-drm").apply { isDaemon = true }
+        }
+    private val drmTimeoutMs = 5000L
+
+    private fun drmWithTimeout(block: () -> String): String {
+        val f = drmExecutor.submit(java.util.concurrent.Callable { block() })
+        return try {
+            f.get(drmTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (te: java.util.concurrent.TimeoutException) {
+            f.cancel(false)
+            "<timeout> DRM HAL 无响应(${drmTimeoutMs}ms)"
+        } catch (t: Throwable) {
+            val cause = (t as? java.util.concurrent.ExecutionException)?.cause ?: t
+            "<error> ${cause.javaClass.simpleName}"
+        }
+    }
+
     /** Widevine deviceUniqueId — DRM 层硬件 ID,base64 后输出 */
     @SuppressLint("HardwareIds")
-    private fun widevineDeviceId(): String {
-        return try {
+    private fun widevineDeviceId(): String = drmWithTimeout {
+        try {
             val drm = android.media.MediaDrm(WIDEVINE_UUID)
             val bytes = drm.getPropertyByteArray("deviceUniqueId")
             drm.close()
@@ -3910,8 +3941,8 @@ class GhostCollector(
         }
     }
 
-    private fun widevineProperty(key: String): String {
-        return try {
+    private fun widevineProperty(key: String): String = drmWithTimeout {
+        try {
             val drm = android.media.MediaDrm(WIDEVINE_UUID)
             val v = drm.getPropertyString(key)
             drm.close()

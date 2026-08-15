@@ -129,6 +129,16 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // ★gv 已在前台时再 am start --es auto collect 会走 onNewIntent 而非 onCreate,
+    //   补此处理避免脚本化重触发"必须先 force-stop 才采集"。
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent?.getStringExtra("auto") == "collect") {
+            btnCollect.post { runCollection() }
+        }
+    }
+
     private fun ensureStoragePermission() {
         // Android 11+ 优先 MANAGE_EXTERNAL_STORAGE,否则 fallback 到 legacy WRITE
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -151,6 +161,7 @@ class MainActivity : AppCompatActivity() {
                 Manifest.permission.ACCESS_FINE_LOCATION,
                 Manifest.permission.ACCESS_COARSE_LOCATION,
                 Manifest.permission.READ_PHONE_STATE,
+                Manifest.permission.CAMERA,
             )) {
                 if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
                     needed += perm
@@ -229,6 +240,7 @@ class MainActivity : AppCompatActivity() {
                     append("ghost: ${ghostCost}ms / SDK: ${sdkCost}ms\n")
                     append("设备: ${ghostReport.deviceLabel}\n")
                     append("ghost 字段: ${ghostReport.fieldCount}, ❌不一致: ${ghostReport.inconsistentCount}, 🚨高危: $hiRisk, ⚠风险: $lowRisk\n")
+                    append("聚集信号: ${ghostReport.clusteringSignals.count { it.available }}/${ghostReport.clusteringSignals.size} 可读\n")
                     if (sdkReport != null) {
                         append("SDK 风险等级: ${sdkReport.overallRiskLevel}, 分数: ${sdkReport.riskScore}/${sdkReport.maxRiskScore}\n")
                         append("SDK 检测: ⚠️${sdkReport.warningCount} / 🚨${sdkReport.dangerCount}\n")
@@ -458,6 +470,9 @@ class MainActivity : AppCompatActivity() {
             val r = riskTag(f) ?: continue
             if (r.startsWith("🚨")) hi++ else if (r.startsWith("⚠")) lo++
         }
+        for (violation in report.crossFieldViolations) {
+            if (violation.severity == "high") hi++ else lo++
+        }
         return hi to lo
     }
 
@@ -499,6 +514,27 @@ class MainActivity : AppCompatActivity() {
                     // 有高危的模块默认展开,其余收起 → 一屏先看模块状态,问题模块直接可见
                     addSection(header, body.toString().trimEnd('\n'), expanded = hi > 0)
                 }
+            }
+
+            if (report.crossFieldViolations.isNotEmpty()) {
+                val high = report.crossFieldViolations.count { it.severity == "high" }
+                val body = report.crossFieldViolations.joinToString("\n\n") { violation ->
+                    buildString {
+                        append(if (violation.severity == "high") "🚨 " else "⚠ ")
+                        append(violation.ruleName).append("\n")
+                        append("  实际: ").append(violation.values.entries.joinToString { (name, value) ->
+                            "$name=${trunc(value, 80)}"
+                        }).append("\n")
+                        append("  期望: ").append(violation.expected)
+                        if (violation.note.isNotBlank()) append("\n  说明: ").append(violation.note)
+                    }
+                }
+                val mark = if (high > 0) "🚨" else "⚠"
+                addSection(
+                    "$mark 【跨字段风控规则】 ${report.crossFieldViolations.size}  🚨$high",
+                    body,
+                    expanded = high > 0,
+                )
             }
         }
 
