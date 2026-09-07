@@ -23,6 +23,10 @@
 #include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/mman.h>
+#include <algorithm>
+#include <cctype>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <android/log.h>
@@ -68,6 +72,94 @@ Java_com_ghost_verify_NativeBridge_getSystemPropertyViaFind(JNIEnv* env, jclass,
     int len = __system_property_read(pi, name, value);
     if (len <= 0) return env->NewStringUTF("");
     return env->NewStringUTF(value);
+}
+
+// ============================================================
+// getSystemPropertyViaPropArea: 直接 mmap /dev/__properties__ 解析 property area,
+// 完全绕过 libc(__system_property_get/find/read 都不调)——模拟【只解析属性区二进制】的风控 SDK。
+// libplay 只 hook 了 libc 符号,拦不到直接 mmap;ghost 的 config_cmd 只拦 getprop 命令,也拦不到。
+// bionic prop_info 布局: serial(4B) + value[PROP_VALUE_MAX=92] + name[](name 在 offset 96);
+// 因此 raw scan "key\0"(name)→ name 起点 - 92 = value 起点(null-terminated,定长前置)。
+// 属性区按 SELinux context 分片(/dev/__properties__/u:object_r:*_prop:s0),逐片扫。
+// ============================================================
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_ghost_verify_NativeBridge_getSystemPropertyViaPropArea(JNIEnv* env, jclass, jstring jkey) {
+    if (!jkey) return env->NewStringUTF("");
+    const char* key = env->GetStringUTFChars(jkey, nullptr);
+    size_t klen = strlen(key);
+    std::string result;
+
+    // 1) 收集属性区 context 文件名。优先 opendir;untrusted_app 常被 SELinux 拒 opendir 目录
+    //    (libc 是 open 具体 context 文件、从不 opendir),故回退:mmap property_info raw scan
+    //    出 "u:object_r:*:s0" context 名(app 能 open 具体 prop 文件)。
+    std::vector<std::string> files;
+    DIR* dir = opendir("/dev/__properties__");
+    if (dir) {
+        struct dirent* ent;
+        while ((ent = readdir(dir)) != nullptr) {
+            if (ent->d_name[0] == '.') continue;
+            files.push_back(std::string("/dev/__properties__/") + ent->d_name);
+        }
+        closedir(dir);
+    } else {
+        int pfd = open("/dev/__properties__/property_info", O_RDONLY);
+        if (pfd >= 0) {
+            struct stat st;
+            if (fstat(pfd, &st) == 0 && st.st_size > 0) {
+                size_t sz = (size_t) st.st_size;
+                void* m = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, pfd, 0);
+                if (m != MAP_FAILED) {
+                    const char* b = (const char*) m;
+                    for (size_t i = 0; i + 11 < sz; i++) {
+                        if (memcmp(b + i, "u:object_r:", 11) != 0) continue;
+                        size_t j = i;
+                        while (j < sz && (isalnum((unsigned char) b[j]) || b[j] == ':' || b[j] == '_')) j++;
+                        std::string ctx(b + i, j - i);
+                        if (ctx.find(":s0") != std::string::npos) {
+                            std::string path = "/dev/__properties__/" + ctx;
+                            if (std::find(files.begin(), files.end(), path) == files.end())
+                                files.push_back(path);
+                        }
+                        i = j;
+                    }
+                    munmap(m, sz);
+                }
+            }
+            close(pfd);
+        }
+    }
+
+    // 2) 逐个 context 文件 raw scan "key\0"(prop_info.name)→ name 前 92B = value
+    for (const auto& path : files) {
+        if (!result.empty()) break;
+        int fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) continue;
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_size > 96) {
+            size_t sz = (size_t) st.st_size;
+            void* map = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (map != MAP_FAILED) {
+                const char* base = (const char*) map;
+                for (size_t i = 96; i + klen + 1 <= sz; i++) {
+                    if (base[i] != key[0]) continue;
+                    if (memcmp(base + i, key, klen) == 0 && base[i + klen] == '\0') {
+                        const char* val = base + i - 92;
+                        result.assign(val, strnlen(val, PROP_VALUE_MAX));
+                        break;
+                    }
+                }
+                munmap(map, sz);
+            }
+        }
+        close(fd);
+    }
+
+    // 诊断:区分「读到值(泄漏)」/「拿不到 context 文件(SELinux 拒 opendir+property_info)」/「有文件但 offset 没扫到」
+    if (result.empty()) {
+        result = files.empty() ? "__ERR_NO_ACCESS__" : "__ERR_NOT_FOUND__";
+    }
+    env->ReleaseStringUTFChars(jkey, key);
+    return env->NewStringUTF(result.c_str());
 }
 
 // ============================================================

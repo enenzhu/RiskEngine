@@ -16,6 +16,13 @@ object NativeBridge {
     external fun getSystemPropertyViaFind(key: String): String
 
     /**
+     * 直接 mmap /dev/__properties__ 解析 property area,完全绕过 libc(不调 __system_property_*)。
+     * 模拟【只解析属性区二进制】的风控 SDK:libplay 只 hook libc 符号拦不到、ghost config_cmd 只拦
+     * getprop 命令也拦不到 → 若与 getSystemProperty 不一致,说明属性区文件未被重定向 = 泄漏物理真值。
+     */
+    external fun getSystemPropertyViaPropArea(key: String): String
+
+    /**
      * popen(cmd) 执行 shell + 读 stdout。模拟商业风控用 getprop / uname -a /
      * cat /sys/devices/soc0/serial_number / ip a / ps -ef 等命令绕过 Java/native
      * 路径直接走 execve+svc_openat。ghost SVC IO 重定向覆盖不全在这里能看到。

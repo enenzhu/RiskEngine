@@ -798,6 +798,19 @@ class GhostCollector(
             field("ro.board.platform.shell_getprop",
                 "getprop" sLayer { getpropShell("ro.board.platform") },
             )
+            // ★对抗:直接 mmap /dev/__properties__ 解析属性区二进制,绕过 libc(__system_property_*)
+            //   + getprop 命令两条已 hook 路径。若与上面 native ro.board.platform 不一致 = ghost 未重定向
+            //   属性区文件 = 泄漏物理真值(board.platform/boot.hardware.platform 全局改会崩 EGL 故未改)。
+            //   product.model 作对照(全局 resetprop 改了属性区,prop_area 读也应是 spoof → 一致)。
+            field("ro.board.platform.prop_area",
+                "prop_area /dev/__properties__" nLayer { NativeBridge.getSystemPropertyViaPropArea("ro.board.platform") },
+            )
+            field("ro.boot.hardware.platform.prop_area",
+                "prop_area /dev/__properties__" nLayer { NativeBridge.getSystemPropertyViaPropArea("ro.boot.hardware.platform") },
+            )
+            field("ro.product.model.prop_area",
+                "prop_area /dev/__properties__" nLayer { NativeBridge.getSystemPropertyViaPropArea("ro.product.model") },
+            )
             field("ro.hardware.chipname",
                 "getprop" sLayer { getpropShell("ro.hardware.chipname") },
             )
