@@ -8,6 +8,8 @@ data class SourceValue(
     val error: String? = null
 )
 
+enum class ComparisonStatus { UNAVAILABLE, SINGLE_SOURCE, CONSISTENT, INCONSISTENT }
+
 /** 单个字段的多源聚合 + 一致性判定。 */
 data class FieldResult(
     val name: String,
@@ -16,6 +18,14 @@ data class FieldResult(
     val consistent: Boolean,
     val canonicalValue: String? = null
 ) {
+    val validSourceCount = sources.count { !it.value.isNullOrEmpty() }
+    val comparisonStatus = when {
+        validSourceCount == 0 -> ComparisonStatus.UNAVAILABLE
+        validSourceCount == 1 -> ComparisonStatus.SINGLE_SOURCE
+        !consistent -> ComparisonStatus.INCONSISTENT
+        else -> ComparisonStatus.CONSISTENT
+    }
+
     companion object {
         fun build(name: String, category: String, sources: List<SourceValue>): FieldResult {
             val nonNullValues = sources.mapNotNull { it.value?.takeIf { v -> v.isNotEmpty() } }.toSet()
@@ -56,7 +66,16 @@ data class CollectReport(
      * 由 tools/compare_clustering_reports.py 在显式 physical/identity 分组下判定。
      */
     val clusteringSignals: List<ClusteringSignal> = emptyList(),
-)
+) {
+    val coverage = FieldCoverage(
+        unavailable = fields.count { it.comparisonStatus == ComparisonStatus.UNAVAILABLE },
+        singleSource = fields.count { it.comparisonStatus == ComparisonStatus.SINGLE_SOURCE },
+        consistent = fields.count { it.comparisonStatus == ComparisonStatus.CONSISTENT },
+        inconsistent = fields.count { it.comparisonStatus == ComparisonStatus.INCONSISTENT },
+    )
+}
+
+data class FieldCoverage(val unavailable: Int, val singleSource: Int, val consistent: Int, val inconsistent: Int)
 
 /** 风控用于跨报告归并设备的稳定信号。 */
 data class ClusteringSignal(
@@ -315,27 +334,8 @@ object CrossFieldChecker {
 
         // === SIM Country ISO 同源 → 移至 telephony 组(用真 field 名 networkCountryIso/simCountryIso)===
 
-        // === 物理对角线合理性 ===
-        val resV = map["resolution"]?.canonicalValue
-        val dpiV = map["dpi_app_resources_java"]?.canonicalValue?.toIntOrNull()
-        if (resV != null && dpiV != null && dpiV > 0) {
-            val nums = Regex("\\d+").findAll(resV).map { it.value.toInt() }.toList()
-            if (nums.size >= 2) {
-                val w = nums.max().toDouble(); val h = nums.min().toDouble()
-                val diag = Math.sqrt(w*w + h*h) / dpiV
-                if (diag !in 4.0..8.5) {
-                    violations += CrossFieldViolation(
-                        ruleName = "PHYSICAL_DIAGONAL_OUT_OF_RANGE",
-                        severity = "high",
-                        fields = listOf("resolution", "dpi_app_resources_java"),
-                        values = mapOf("resolution" to resV, "dpi" to dpiV.toString(),
-                                       "diagonal" to "%.2f\"".format(diag)),
-                        expected = "对角线 ∈ [4.0\", 8.5\"](手机范围)",
-                        note = "可能 res 或 dpi 错配"
-                    )
-                }
-            }
-        }
+        // Logical densityDpi is a resource scale, not panel pixels per inch.
+        // No physical-diagonal verdict without trustworthy panel dimensions and form factor.
 
         // === Keystore/Attestation 值异常(K1/K5;K2/K3/K4 已是双源 field 自动查一致性)===
         map["tee.chain_verified"]?.canonicalValue?.let { cv ->

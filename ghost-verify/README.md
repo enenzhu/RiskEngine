@@ -125,3 +125,21 @@ python3 ghost-verify/tools/compare_clustering_reports.py \
 ```
 
 `SOC_MODEL` 不一致 = ghost BuildHook 把 model 错赋给了 SOC_MODEL(已修复)。
+
+## 覆盖率与判定边界
+
+每个字段新增 `validSourceCount` 和 `comparisonStatus`：UNAVAILABLE=无有效来源，SINGLE_SOURCE=仅一个来源，CONSISTENT=至少两个有效来源相同，INCONSISTENT=来源冲突。部分来源失败时，仍需结合 `validSourceCount / sources.size` 判断覆盖缺项。报告 `coverage` 分别统计四类；旧 `consistent` 布尔值仅保留兼容，不能单独作为验收门槛。界面把字段冲突与跨字段告警分开显示，未采集和单来源不再显示为绿色通过。
+
+逻辑 densityDpi 不能用于计算物理英寸；缺少可信面板尺寸及形态时不产生物理对角线结论。SDK native 调试检查只读 TracerPid，不执行改变跟踪状态的 PTRACE_TRACEME；读取失败不构成阳性证据，也不证明没有调试器。
+
+回归命令：
+
+```bash
+./gradlew :ghost-verify:testDebugUnitTest :ghost-verify:assembleDebug --offline
+clang++ -std=c++17 riskengine-sdk/src/test/cpp/native_debug_detector_test.cpp riskengine-sdk/src/main/cpp/detector/native_debug_detector.cpp -o /tmp/ghost-native-debug-test
+/tmp/ghost-native-debug-test
+```
+
+ReportCoverageTest 覆盖零来源、单来源、部分采集、多源冲突和 JSON 导出，以及平板逻辑分辨率不触发旧手机对角线规则。native 用例覆盖无 tracer、重复检查、正 TracerPid 和读取失败。
+
+2026-10-18 USB 20-4 实测：552 字段中 38 项未采集、425 项单来源、87 项多源一致、2 项冲突；移除错误屏幕规则后保留 7 项跨字段告警，SDK 分数从原 ptrace 误判的 8 降为 0。该结果不代表既有 SDK/认证版本、空加密、硬件家族或 meminfo 冻结问题已解决。

@@ -229,7 +229,9 @@ class MainActivity : AppCompatActivity() {
                     append("✅ 采集完成\n")
                     append("ghost: ${ghostCost}ms / SDK: ${sdkCost}ms\n")
                     append("设备: ${ghostReport.deviceLabel}\n")
-                    append("ghost 字段: ${ghostReport.fieldCount}, ❌不一致: ${ghostReport.inconsistentCount}, 🚨高危: $hiRisk, ⚠风险: $lowRisk\n")
+                    append("ghost 字段: ${ghostReport.fieldCount}, 多源冲突: ${ghostReport.coverage.inconsistent}, 跨字段告警: ${ghostReport.crossFieldViolations.size}\n")
+                    append("覆盖: 未采集 ${ghostReport.coverage.unavailable} / 单来源 ${ghostReport.coverage.singleSource} / 多源一致 ${ghostReport.coverage.consistent}\n")
+                    append("字段风险: 🚨$hiRisk / ⚠$lowRisk\n")
                     append("聚集信号: ${ghostReport.clusteringSignals.count { it.available }}/${ghostReport.clusteringSignals.size} 可读\n")
                     if (sdkReport != null) {
                         append("SDK 风险等级: ${sdkReport.overallRiskLevel}, 分数: ${sdkReport.riskScore}/${sdkReport.maxRiskScore}\n")
@@ -440,10 +442,12 @@ class MainActivity : AppCompatActivity() {
         val mark = when {
             risk?.startsWith("🚨") == true -> "🚨"
             risk?.startsWith("⚠") == true -> "⚠ "
+            f.comparisonStatus == ComparisonStatus.UNAVAILABLE -> "❔"
+            f.comparisonStatus == ComparisonStatus.SINGLE_SOURCE -> "▫"
             !f.consistent -> "❌"
             else -> "✅"
         }
-        sb.append("  $mark ${f.name} = ${trunc(f.canonicalValue)}")
+        sb.append("  $mark ${f.name} = ${trunc(f.canonicalValue)} [${f.comparisonStatus}; ${f.validSourceCount}/${f.sources.size} 来源]")
         if (risk != null) sb.append("  ← $risk")
         sb.append("\n")
         if (expandSources || !f.consistent || risk != null) {
@@ -481,7 +485,7 @@ class MainActivity : AppCompatActivity() {
             val showAll = viewMode == 0
             val ghostFields = if (showAll) report.fields else report.fields.filter { !it.consistent }
             if (ghostFields.isEmpty()) {
-                addSection("✅ Ghost-Verify(全部字段一致)", "无不一致字段", expanded = false)
+                addSection("Ghost-Verify(无多源冲突)", "未采集和单来源见覆盖汇总，不代表已验证通过；跨字段告警单独列出", expanded = false)
             } else {
                 val grouped = LinkedHashMap<String, MutableList<FieldResult>>()
                 ghostFields.forEach { grouped.getOrPut(it.category) { mutableListOf() }.add(it) }
@@ -492,7 +496,7 @@ class MainActivity : AppCompatActivity() {
                         if (r?.startsWith("🚨") == true) hi++ else if (r?.startsWith("⚠") == true) lo++
                         if (!f.consistent) incons++
                     }
-                    val statusMark = if (hi > 0) "🚨" else if (lo > 0 || incons > 0) "⚠" else "✅"
+                    val statusMark = if (hi > 0) "🚨" else if (lo > 0 || incons > 0) "⚠" else if (list.any { it.comparisonStatus != ComparisonStatus.CONSISTENT }) "▫" else "✅"
                     val header = buildString {
                         append("$statusMark 【$cat】 ${list.size}")
                         if (hi > 0) append("  🚨$hi")

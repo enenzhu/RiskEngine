@@ -3,7 +3,6 @@
 #include <string>
 #include <cstring>
 #include <cstdlib>
-#include <sys/ptrace.h>
 #include <fcntl.h>
 
 int get_tracer_pid() {
@@ -19,12 +18,7 @@ int get_tracer_pid() {
 }
 
 bool check_ptrace() {
-    // Try to ptrace ourselves; if already being traced, this will fail
-    long ret = ptrace(PTRACE_TRACEME, 0, nullptr, nullptr);
-    if (ret < 0) {
-        return true; // Already being traced
-    }
-    // Detach
-    ptrace(PTRACE_DETACH, 0, nullptr, nullptr);
-    return false;
+    // TRACEME can fail under policy restrictions and changes the caller's tracing state.
+    // Only a positive TracerPid is evidence of an attached tracer.
+    return get_tracer_pid() > 0;
 }
