@@ -51,5 +51,9 @@
         <activity
             android:name=".AppListActivity"
             android:exported="true" />
+        <!-- 进程环境观测:headless 用 am start 带 extra auto=observe 触发(命令见 README) -->
+        <activity
+            android:name=".ProcessEnvActivity"
+            android:exported="true" />
     </application>
 </manifest>

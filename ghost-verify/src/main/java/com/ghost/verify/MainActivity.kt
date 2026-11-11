@@ -45,6 +45,17 @@ class MainActivity : AppCompatActivity() {
         // 在 Android 16 + edge-to-edge 下它会盖住 LinearLayout 第一个 button → 按钮不可见
         supportActionBar?.hide()
 
+        // 合成自检在 SDK 初始化、权限请求和采集器之前返回。
+        if (intent?.getStringExtra("auto") == "selftest") {
+            runReportSelfTest()
+            return
+        }
+
+        if (intent?.getStringExtra("auto") == "restore-audit") {
+            runRestoreAudit()
+            return
+        }
+
         // 初始化 RiskEngine SDK(同应用进程,只 init 一次)
         if (!RiskEngine.isInitialized()) {
             RiskEngine.init(
@@ -98,8 +109,13 @@ class MainActivity : AppCompatActivity() {
             addView(btnClear, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
             addView(btnAppList, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         }
+        val btnProcessEnv = Button(this).apply { text = "进程环境观测" }
+        btnProcessEnv.setOnClickListener {
+            startActivity(android.content.Intent(this, ProcessEnvActivity::class.java))
+        }
         root.addView(btnRow)
         root.addView(btnRow2)
+        root.addView(btnProcessEnv)
         root.addView(tvSummary)
         root.addView(scroll)
         setContentView(root)
@@ -127,6 +143,70 @@ class MainActivity : AppCompatActivity() {
         if (intent?.getStringExtra("auto") == "collect") {
             btnCollect.post { runCollection() }
         }
+    }
+
+    /** 恢复回归专用：不初始化 SDK、不读 GMS 账号或 SnapshotStore、不运行网络探针。 */
+    private fun runRestoreAudit() {
+        val status = TextView(this).apply { text = "恢复字段观测采集中..."; setPadding(32, 32, 32, 32) }
+        setContentView(status)
+        val runId = intent?.getStringExtra("audit_run_id").orEmpty()
+        if (!runId.matches(Regex("[A-Za-z0-9_-]{1,80}"))) {
+            status.text = "缺少合法 audit_run_id"
+            android.util.Log.e("GhostVerifyRestore", "COLLECT_FAILED reason=invalid_run_id")
+            return
+        }
+        thread {
+            try {
+                val dir = File(getExternalFilesDir(null) ?: filesDir, "restore_audit").apply { mkdirs() }
+                val output = File(dir, "restore_audit_$runId.json")
+                check(!output.exists()) { "run_id_reused" }
+                val startedAt = System.currentTimeMillis()
+                val before = restoreAuditState()
+                val report = GhostCollector(applicationContext, restoreAuditOnly = true).collectAll()
+                val after = restoreAuditState()
+                val audit = RestoreAuditContext(runId, startedAt, System.currentTimeMillis(), before, after)
+                val body = linkedMapOf(
+                    "_meta" to mapOf("restore_audit" to audit),
+                    "ghost" to report,
+                )
+                output.writeText(GsonBuilder().setPrettyPrinting().disableHtmlEscaping().create().toJson(body))
+                android.util.Log.i("GhostVerifyRestore", "COLLECT_DONE path=${output.absolutePath} fields=${report.fieldCount}")
+                runOnUiThread { status.text = "恢复字段观测已保存，待本地比较器审计。\n${output.absolutePath}" }
+            } catch (_: Throwable) {
+                android.util.Log.e("GhostVerifyRestore", "COLLECT_FAILED reason=collection_or_save_failed")
+                runOnUiThread { status.text = "恢复字段观测失败（run ID 不得重复），不能作为回归通过证据。" }
+            }
+        }
+    }
+
+    private fun restoreAuditState(): RestoreAuditState {
+        val process = android.app.Application.getProcessName()
+        val roster = runCatching { GhostCall.raw(applicationContext, "getHookPkgs", emptyMap()) }.getOrNull()
+        val response = GhostCall.query(applicationContext, "expectedEnv", mapOf("pkg" to packageName, "process" to process))
+        return RestoreAuditState.fromResponses(roster, response, packageName, process)
+    }
+
+    private fun runReportSelfTest() {
+        val context = ObservationContext(
+            packageName = packageName,
+            processName = android.app.Application.getProcessName(),
+            uid = android.os.Process.myUid(),
+            pid = android.os.Process.myPid(),
+        )
+        val result = ReportSelfTest.run(context)
+        val json = GsonBuilder().setPrettyPrinting().create().toJson(result)
+        val output = File(getExternalFilesDir(null) ?: filesDir, "report_selftest.json")
+        val saveError = runCatching { output.writeText(json) }.exceptionOrNull()
+        setContentView(ScrollView(this).apply {
+            addView(TextView(this@MainActivity).apply {
+                text = "报告合成自检: ${if (result.passed) "PASS" else "FAIL"}\n" +
+                    "只验证报告格式与判定逻辑，不采集设备字段。\n" +
+                    "${saveError?.let { "结果保存失败: ${it.message}" } ?: "文件: ${output.absolutePath}"}\n\n$json"
+                setPadding(32, 32, 32, 32)
+            })
+        })
+        android.util.Log.i("GhostVerifySelfTest",
+            "passed=${result.passed} checks=${result.checks.size} saved=${saveError == null}")
     }
 
     private fun ensureStoragePermission() {
@@ -170,12 +250,38 @@ class MainActivity : AppCompatActivity() {
         val hasExplicitReferrer = intent?.hasExtra(Intent.EXTRA_REFERRER) == true ||
             intent?.hasExtra(Intent.EXTRA_REFERRER_NAME) == true
         thread {
+            // 0) GMS 进程 clone 基准(Google 档案视角)。失败不阻断主采集,错误进 _meta。
+            val gmsCloneT0 = System.currentTimeMillis()
+            val (gmsClone, gmsCloneError) = GmsClone.collect(applicationContext)
+            val gmsCloneCost = System.currentTimeMillis() - gmsCloneT0
+
+            // 0.5) Ghost 给本进程的期望值(APP_VS_EXPECTED)。旧 Ghost → unsupported,不比较、不计风险。
+            val myProcess = android.app.Application.getProcessName()
+            val expectedResp = GhostCall.query(applicationContext,
+                "expectedEnv", mapOf("pkg" to packageName, "process" to myProcess))
+            val expectedEnv = (expectedResp as? GhostCallResult.Ok)?.let { ProcessEnvModel.parseExpected(it.body) }
+            // GMS 主进程走的是 L1(Google 共享档案补丁),与虚拟设备本来就可以不同;单独取它的期望
+            // SECURITY_PATCH,不然 GMS↔app 身份对比会把 L1 的正常差异报成串档。
+            val gmsExpectedPatch = if (gmsClone != null) runCatching {
+                val resp = GhostCall.query(applicationContext, "expectedEnv",
+                    mapOf("pkg" to "com.google.android.gms", "process" to "com.google.android.gms"))
+                (resp as? GhostCallResult.Ok)?.let { ProcessEnvModel.parseExpected(it.body).expected["build.securityPatch"] }
+            }.getOrNull() else null
+            val expectedStatus = when (expectedResp) {
+                is GhostCallResult.Ok -> "ok layer=${expectedEnv?.layer} keys=${expectedEnv?.expected?.size}"
+                is GhostCallResult.Unsupported -> "unsupported"
+                is GhostCallResult.Failed -> "error: ${expectedResp.error}"
+            }
+
             val t0 = System.currentTimeMillis()
             // 1) ghost-verify 自己的多路径一致性采集
             val ghostReport = GhostCollector(
                 applicationContext,
                 collectionReferrer,
                 hasExplicitReferrer,
+                gmsClone,
+                expectedEnv?.expected,
+                gmsExpectedPatch,
             ).collectAll()
             val ghostCost = System.currentTimeMillis() - t0
 
@@ -208,6 +314,18 @@ class MainActivity : AppCompatActivity() {
                     "ghost_cost_ms" to ghostCost,
                     "sdk_cost_ms" to sdkCost,
                     "sdk_error" to sdkError,
+                    "gms_clone_cost_ms" to gmsCloneCost,
+                    "gms_clone_path" to gmsClone?.rawPath,
+                    "gms_clone_error" to gmsCloneError,
+                    // ok / unsupported(旧 Ghost) / error
+                    "expected_env_status" to when (expectedResp) {
+                        is GhostCallResult.Ok -> "ok"
+                        is GhostCallResult.Unsupported -> "unsupported"
+                        is GhostCallResult.Failed -> "error"
+                    },
+                    "expected_env_error" to (expectedResp as? GhostCallResult.Failed)?.error,
+                    "expected_env_layer" to expectedEnv?.layer,
+                    "expected_env_device_id" to expectedEnv?.deviceId,
                 ),
                 "ghost" to ghostReport,
                 "riskengine_sdk" to sdkReport,
@@ -229,8 +347,13 @@ class MainActivity : AppCompatActivity() {
                     append("✅ 采集完成\n")
                     append("ghost: ${ghostCost}ms / SDK: ${sdkCost}ms\n")
                     append("设备: ${ghostReport.deviceLabel}\n")
+                    ghostReport.observationContext?.let {
+                        append("采集器: ${it.processName} / uid=${it.uid} / pid=${it.pid}\n")
+                        append("来源范围: 采集器及子进程；不证明 GMS/DroidGuard 的实际采集或上传。\n")
+                    }
                     append("ghost 字段: ${ghostReport.fieldCount}, 多源冲突: ${ghostReport.coverage.inconsistent}, 跨字段告警: ${ghostReport.crossFieldViolations.size}\n")
-                    append("覆盖: 未采集 ${ghostReport.coverage.unavailable} / 单来源 ${ghostReport.coverage.singleSource} / 多源一致 ${ghostReport.coverage.consistent}\n")
+                    append("覆盖: 未采集 ${ghostReport.coverage.unavailable} / 单来源 ${ghostReport.coverage.singleSource} / 多源一致 ${ghostReport.coverage.consistent} / 权限不可采 ${ghostReport.coverage.permissionGated}\n")
+                    append("Ghost 期望值: ${expectedStatus}\n")
                     append("字段风险: 🚨$hiRisk / ⚠$lowRisk\n")
                     append("聚集信号: ${ghostReport.clusteringSignals.count { it.available }}/${ghostReport.clusteringSignals.size} 可读\n")
                     if (sdkReport != null) {
@@ -465,7 +588,12 @@ class MainActivity : AppCompatActivity() {
             if (r.startsWith("🚨")) hi++ else if (r.startsWith("⚠")) lo++
         }
         for (violation in report.crossFieldViolations) {
-            if (violation.severity == "high") hi++ else lo++
+            // info 级只是说明(如 unstable 未运行),不计风险。
+            when (violation.severity) {
+                "high" -> hi++
+                "info" -> {}
+                else -> lo++
+            }
         }
         return hi to lo
     }
@@ -514,7 +642,7 @@ class MainActivity : AppCompatActivity() {
                 val high = report.crossFieldViolations.count { it.severity == "high" }
                 val body = report.crossFieldViolations.joinToString("\n\n") { violation ->
                     buildString {
-                        append(if (violation.severity == "high") "🚨 " else "⚠ ")
+                        append(when (violation.severity) { "high" -> "🚨 "; "info" -> "ℹ "; else -> "⚠ " })
                         append(violation.ruleName).append("\n")
                         append("  实际: ").append(violation.values.entries.joinToString { (name, value) ->
                             "$name=${trunc(value, 80)}"

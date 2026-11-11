@@ -51,6 +51,75 @@ data class CrossFieldViolation(
     val note: String = ""
 )
 
+// ============================================================
+// "可采性"统一语义:两侧比对(app↔GMS、app↔Ghost 期望、进程↔期望)都先归一再判定
+// ============================================================
+
+/**
+ * 一对字段的比对结论。
+ * - MATCH / MISMATCH:两侧都可采,值相等 / 不等。只有 MISMATCH 会按规则出 violation。
+ * - NOT_COLLECTABLE:权限门控字段任意一侧不可采,或两侧都没值,或一侧是权限拒绝 —— 永不出 violation。
+ * - ONE_SIDED:非权限字段一边有值一边空/占位(hook 只覆盖了一边,或旧 Ghost 缺键)—— 只出 low。
+ * - NOT_RUN:比对对象根本没跑(如 gms.unstable 未启动、观测目标进程无结果)。
+ */
+enum class PairStatus { MATCH, MISMATCH, NOT_COLLECTABLE, ONE_SIDED, NOT_RUN }
+
+/** 一条比对记录;left/right 是 leftField/rightField 对应的值(可采时为规范值,否则为原始占位值或 null)。 */
+data class PairResult(
+    val field: String,
+    val leftField: String,
+    val rightField: String,
+    val left: String?,
+    val right: String?,
+    val status: PairStatus,
+    val reason: String? = null,
+)
+
+/** 报告里的 `baseline` 段:所有参与比对的对逐条输出,含 MATCH,便于 harness 统计覆盖。 */
+data class BaselineReport(val pairs: List<PairResult>)
+
+/**
+ * 需要特权权限才能读到真值的字段(普通 app 无 READ_PRIVILEGED_PHONE_STATE / READ_PHONE_NUMBERS)。
+ * 任意一侧不可采 → NOT_COLLECTABLE,永不产生 violation;coverage 单列为 permissionGated。
+ * app 侧目前只采了 Build.getSerial() 与 line1Number;IMEI/MEID/subscriberId/ICCID 无 app 字段。
+ */
+val PERMISSION_GATED: Set<String> = setOf(
+    "Build.getSerial() (info-only)",
+    "line1Number",
+    "gms.telephony.imei",
+    "gms.telephony.meid",
+    "gms.telephony.serialno",
+)
+
+/**
+ * 把一次观测归一成 (规范值, null) 或 (null, 不可采原因)。
+ * 原因:"permission"(SecurityException / <denied>)、"placeholder"("unknown"、身份类字段的 "-1")、"empty"。
+ */
+fun normalizeObserved(value: String?, error: String?, identity: Boolean = false): Pair<String?, String?> {
+    if (error != null && error.trim().removePrefix("java.lang.").startsWith("SecurityException")) {
+        return null to "permission"
+    }
+    val v = value?.trim()
+    if (v.isNullOrEmpty()) return null to "empty"
+    if (v.startsWith("<denied", ignoreCase = true)) return null to "permission"
+    if (v.equals("unknown", ignoreCase = true)) return null to "placeholder"
+    if (identity && v == "-1") return null to "placeholder"
+    return v to null
+}
+
+/** 字段的首个采集错误(只在没有任何值时才有意义)。 */
+internal fun FieldResult.firstError(): String? =
+    if (canonicalValue == null) sources.firstNotNullOfOrNull { it.error } else null
+
+/** 采集器所在进程；只能说明报告的来源，不能证明其它应用进程的实际读值。 */
+data class ObservationContext(
+    val packageName: String,
+    val processName: String,
+    val uid: Int,
+    val pid: Int,
+    val scope: String = "collector_process_and_children",
+)
+
 /** 整个采集 session 的根 report。 */
 data class CollectReport(
     val timestamp: Long,
@@ -66,16 +135,36 @@ data class CollectReport(
      * 由 tools/compare_clustering_reports.py 在显式 physical/identity 分组下判定。
      */
     val clusteringSignals: List<ClusteringSignal> = emptyList(),
+    // 旧报告没有此项时来源未知，不能用其它进程的信息补猜。
+    val observationContext: ObservationContext? = null,
+    /** 两侧比对明细(app↔GMS、app↔Ghost 期望);旧报告无此项。 */
+    val baseline: BaselineReport? = null,
 ) {
-    val coverage = FieldCoverage(
-        unavailable = fields.count { it.comparisonStatus == ComparisonStatus.UNAVAILABLE },
-        singleSource = fields.count { it.comparisonStatus == ComparisonStatus.SINGLE_SOURCE },
-        consistent = fields.count { it.comparisonStatus == ComparisonStatus.CONSISTENT },
-        inconsistent = fields.count { it.comparisonStatus == ComparisonStatus.INCONSISTENT },
-    )
+    val coverage: FieldCoverage = run {
+        // 权限门控且不可采的字段单列,不再混进"未采集/单来源"。
+        val gated = fields.filter {
+            it.name in PERMISSION_GATED &&
+                normalizeObserved(it.canonicalValue, it.firstError(), identity = true).first == null
+        }.map { it.name }.toSet()
+        val rest = fields.filter { it.name !in gated }
+        FieldCoverage(
+            unavailable = rest.count { it.comparisonStatus == ComparisonStatus.UNAVAILABLE },
+            singleSource = rest.count { it.comparisonStatus == ComparisonStatus.SINGLE_SOURCE },
+            consistent = rest.count { it.comparisonStatus == ComparisonStatus.CONSISTENT },
+            inconsistent = rest.count { it.comparisonStatus == ComparisonStatus.INCONSISTENT },
+            permissionGated = gated.size,
+        )
+    }
 }
 
-data class FieldCoverage(val unavailable: Int, val singleSource: Int, val consistent: Int, val inconsistent: Int)
+/** permissionGated:PERMISSION_GATED 字段且归一后不可采(权限拒绝/占位/空),不计入其它桶。 */
+data class FieldCoverage(
+    val unavailable: Int,
+    val singleSource: Int,
+    val consistent: Int,
+    val inconsistent: Int,
+    val permissionGated: Int = 0,
+)
 
 /** 风控用于跨报告归并设备的稳定信号。 */
 data class ClusteringSignal(
@@ -185,10 +274,16 @@ object ClusteringSignalCatalog {
 
 /** 跨字段一致性规则引擎。 */
 object CrossFieldChecker {
-    /** 检查所有 cross-field 规则,返回 violation 列表 */
-    fun run(fields: List<FieldResult>): List<CrossFieldViolation> {
+    data class CheckResult(val violations: List<CrossFieldViolation>, val pairs: List<PairResult>)
+
+    /** 检查所有 cross-field 规则,返回 violation 列表(兼容旧调用) */
+    fun run(fields: List<FieldResult>): List<CrossFieldViolation> = evaluate(fields).violations
+
+    /** 规则 + 两侧比对明细;pairs 进报告 `baseline.pairs`。 */
+    fun evaluate(fields: List<FieldResult>): CheckResult {
         val map = fields.associateBy { it.name }
         val violations = mutableListOf<CrossFieldViolation>()
+        val pairs = mutableListOf<PairResult>()
 
         // === DPI 同源校验:所有 dpi 类 field 理论值都 = ghost spoof dpi(±5 容差) ===
         val dpiFields = listOf(
@@ -1436,8 +1531,384 @@ object CrossFieldChecker {
             }
         }
 
-        return violations
+        // ============================================================
+        // GMS 进程 clone 基准(另一个进程的 hook 视角)
+        //   app 侧=虚拟身份,GMS/Play=Google 兼容档案 —— 身份字段允许不同;
+        //   运行时/电源/USB 字段同一物理机必须相同。身份字段只做 GMS 档案自洽校验。
+        // ============================================================
+        if (map["gms.process_pkg"]?.canonicalValue != null) {
+            fun gms(name: String): String? =
+                map["gms.$name"]?.canonicalValue?.trim()?.takeIf { it.isNotEmpty() }
+
+            val runtimePairs = listOf(
+                "SDK_INT" to "SDK_INT",
+                "ADB_ENABLED" to "runtime.adb_enabled",
+                "DEVELOPMENT_SETTINGS_ENABLED" to "runtime.development_settings_enabled",
+                "USB.device_count" to "runtime.usb_device_count",
+                "USB.current_functions" to "runtime.usb_current_functions",
+                "USB.native_sys_usb_config" to "runtime.sys_usb_config",
+                "USB.native_init_svc_adbd" to "runtime.init_svc_adbd",
+                "battery.is_charging" to "battery.is_charging",
+                "battery.status" to "battery.status",
+                "battery.plugged" to "battery.plugged",
+            )
+            for ((appField, gmsField) in runtimePairs) {
+                val p = comparePair(appField, side(map, appField), side(map, "gms.$gmsField"))
+                pairs += p
+                when (p.status) {
+                    PairStatus.MISMATCH -> violations += CrossFieldViolation(
+                        ruleName = "GMS_RUNTIME_VIEW_MISMATCH",
+                        severity = "high",
+                        fields = listOf(appField, "gms.$gmsField"),
+                        values = mapOf(appField to p.left?.lowercase(), "gms.$gmsField" to p.right?.lowercase()),
+                        expected = "$appField 在 app 与 GMS 进程必须一致(同一物理运行时)",
+                        note = "跨进程 hook 覆盖不一致:一边装了一边漏了",
+                    )
+                    PairStatus.ONE_SIDED -> violations += oneSidedViolation(p)
+                    else -> {}
+                }
+            }
+
+            // GMS 主进程跟随虚拟设备(只有 .unstable 装 Play Integrity 档案),clone 采集也只在
+            // 主/persistent。身份字段必须与 app 全等;不一致说明档案串进了主进程,快照会写成 Pixel。
+            val identityPairs = listOf(
+                "MANUFACTURER" to "MANUFACTURER", "BRAND" to "BRAND", "MODEL" to "MODEL",
+                "DEVICE" to "DEVICE", "PRODUCT" to "PRODUCT", "HARDWARE" to "HARDWARE",
+                "BOARD" to "BOARD", "FINGERPRINT" to "FINGERPRINT", "ID" to "ID",
+                "INCREMENTAL" to "INCREMENTAL", "SOC_MODEL" to "SOC_MODEL",
+                "SOC_MANUFACTURER" to "SOC_MANUFACTURER", "SKU" to "SKU",
+                "BOOTLOADER" to "BOOTLOADER", "HOST" to "HOST",
+                // SECURITY_PATCH 不在这里:L1 设计是全部 Google UID 取档案补丁,本来就可以 ≠ 虚拟设备
+                // (wa_26:档案 2026-10-05 / 虚拟设备 2026-10-01),单独按"Google 共享档案补丁"比。
+                "ro.build.description" to "BUILD_DESCRIPTION",
+                "GL_RENDERER" to "gl.renderer", "GL_VENDOR" to "gl.vendor",
+                "cpu_count.available_processors" to "cpu_count",
+                "RELEASE" to "RELEASE",
+                "runtime.total_mem_mb" to "runtime.total_mem_mb",
+                "uname.release" to "uname.release",
+                "uname.machine" to "uname.machine",
+                "timezone" to "timezone",
+                "dpi_app_resources_java" to "display.density_dpi",
+            )
+            val identityResults = identityPairs.map { (appField, gmsField) ->
+                comparePair(appField, side(map, appField, identity = true),
+                    side(map, "gms.$gmsField", identity = true))
+            } + listOf(
+                // 宽高按无序对比较(横竖屏互换算 MATCH)。resolution 是 getRealMetrics 的 "HxW"。
+                // 窗口级 widthPixels/heightPixels 受 Activity 窗口/系统栏影响,与无窗口的 GMS 进程不可比,不比较。
+                comparePair("display.real_size", side(map, "resolution"),
+                    sizeSide(map, "gms.display.real_width", "gms.display.real_height"), equal = ::sizeEqual),
+                // Ghost 用 addLikelySubtags 补国家;app 侧从 Locale tag 取,tag 不带国家时会是 ONE_SIDED。
+                comparePair("locale.country",
+                    side(map, "locale") { java.util.Locale.forLanguageTag(it).country },
+                    side(map, "gms.locale.country")),
+                // L1:全部 Google UID 共享档案补丁,可以 ≠ 虚拟设备(wa_26:档案 2026-10-05 /
+                // 虚拟设备 2026-10-01),所以比的是 Ghost 给 GMS 主进程的 expectedEnv,不是 app 值。
+                comparePair("gms.security_patch",
+                    side(map, "gms.SECURITY_PATCH"),
+                    side(map, "gms.expected.security_patch")),
+                // 权限门控:只比"有值/无值",值本身不进报告。
+                comparePair("telephony.serialno",
+                    side(map, "Build.getSerial() (info-only)", identity = true) { "present" },
+                    side(map, "gms.telephony.serialno", identity = true), gated = true),
+            )
+            for (p in identityResults) {
+                pairs += p
+                val isL1Patch = p.field == "gms.security_patch"
+                when (p.status) {
+                    PairStatus.MISMATCH -> violations += CrossFieldViolation(
+                        ruleName = if (isL1Patch) "GMS_SECURITY_PATCH_VS_EXPECTED" else "GMS_IDENTITY_VS_APP",
+                        severity = "high",
+                        fields = listOf(p.leftField, p.rightField),
+                        values = mapOf(p.leftField to p.left, p.rightField to p.right),
+                        expected = if (isL1Patch) "GMS 主进程的 SECURITY_PATCH 必须等于档案的 L1 共享补丁"
+                        else "GMS 主进程的 ${p.field} 必须等于虚拟设备(app 侧)",
+                        note = if (isL1Patch) "与虚拟设备不同是正常的(全部 Google UID 共享档案补丁)"
+                        else "Google 档案只允许出现在 .unstable,主进程/Play 必须跟随虚拟身份",
+                    )
+                    PairStatus.ONE_SIDED -> violations += oneSidedViolation(p)
+                    else -> {}
+                }
+            }
+
+            // 采集进程必须是主/persistent;采到 .unstable 就说明它装了档案,快照会被写成 Pixel。
+            val gmsProcessName = gms("process_name")
+            if (gmsProcessName != null &&
+                (gmsProcessName.endsWith(".unstable") || gmsProcessName.endsWith(":unstable"))) {
+                violations += CrossFieldViolation(
+                    ruleName = "GMS_CLONE_PROCESS_NAME",
+                    severity = "high",
+                    fields = listOf("gms.process_name"),
+                    values = mapOf("gms.process_name" to gmsProcessName),
+                    expected = "clone 采集进程必须是主 gms 或 persistent",
+                    note = "unstable 进程的 Build 是 Play Integrity 档案",
+                )
+            }
+
+            // unstable 必须证明自己装到了档案(L2 快照由 BuildHook 落盘、主进程采集时取走)。
+            // 新 Ghost 带 profileProbeState:"unstable_not_running" = unstable 本次就没起来,不是 hook 缺口。
+            val probeName = gms("profile_probe.process_name")
+            val probeState = gms("profile_probe.state")
+            fun probePair(status: PairStatus, reason: String?) = PairResult(
+                field = "gms.profile_probe",
+                leftField = "gms.profile_probe.state",
+                rightField = "gms.profile_probe.process_name",
+                left = probeState,
+                right = probeName,
+                status = status,
+                reason = reason,
+            )
+            if (probeName == null && probeState == "unstable_not_running") {
+                pairs += probePair(PairStatus.NOT_RUN, "unstable_not_running")
+                violations += CrossFieldViolation(
+                    ruleName = "GMS_PROFILE_PROBE_NOT_RUN",
+                    severity = "info",
+                    fields = listOf("gms.profile_probe.state"),
+                    values = mapOf("gms.profile_probe.state" to probeState),
+                    expected = ".unstable 运行过才会留下 profile probe",
+                    note = "unstable 本次未启动,不计风险;需要验证档案时先触发一次 Play Integrity",
+                )
+            } else if (probeName == null) {
+                pairs += probePair(PairStatus.MISMATCH, "probe_missing")
+                violations += CrossFieldViolation(
+                    ruleName = "GMS_PROFILE_PROBE_MISSING",
+                    severity = "high",
+                    fields = listOf("gms.profile_probe.present"),
+                    values = mapOf(
+                        "gms.profile_probe.present" to gms("profile_probe.present"),
+                        "gms.profile_probe.state" to probeState,
+                    ),
+                    expected = ".unstable 启动后应留下 profile probe 快照",
+                    note = "unstable 未启动或 BuildHook 的 L2 分支没执行",
+                )
+            } else {
+                val wrongProcess = !probeName.endsWith(".unstable") && !probeName.endsWith(":unstable")
+                val notApplied = gms("profile_probe.applied") != "true"
+                pairs += when {
+                    wrongProcess -> probePair(PairStatus.MISMATCH, "wrong_process")
+                    notApplied -> probePair(PairStatus.MISMATCH, "not_applied")
+                    else -> probePair(PairStatus.MATCH, null)
+                }
+                if (wrongProcess) {
+                    violations += CrossFieldViolation(
+                        ruleName = "GMS_PROFILE_PROBE_WRONG_PROCESS",
+                        severity = "high",
+                        fields = listOf("gms.profile_probe.process_name"),
+                        values = mapOf("gms.profile_probe.process_name" to probeName),
+                        expected = "档案只允许装在 .unstable",
+                        note = "probe 由主进程写出说明进程判定失效",
+                    )
+                }
+                if (notApplied) {
+                    violations += CrossFieldViolation(
+                        ruleName = "GMS_PROFILE_PROBE_NOT_APPLIED",
+                        severity = "high",
+                        fields = listOf("gms.profile_probe.applied"),
+                        values = mapOf("gms.profile_probe.applied" to gms("profile_probe.applied")),
+                        expected = "probe.profileApplied=true",
+                    )
+                }
+                // unstable 只允许在这套指纹身份集上偏离主进程;/proc、os.version 已随虚拟设备(L3),
+                // 这里只确认 probe 至少含档案 SoC(未知代号已失败关闭为全虚拟)。
+                if (gms("profile_probe.SOC_MODEL") == null) {
+                    violations += CrossFieldViolation(
+                        ruleName = "GMS_PROFILE_PROBE_INCOMPLETE",
+                        severity = "medium",
+                        fields = listOf("gms.profile_probe.SOC_MODEL"),
+                        values = emptyMap(),
+                        expected = "probe 应含档案 SoC(未知代号已失败关闭为全虚拟)",
+                    )
+                }
+            }
+
+            // GMS 指纹↔GMS Build 自洽(档案内部不能自相矛盾)。
+            val gfp = gms("FINGERPRINT")
+            if (!gfp.isNullOrBlank()) {
+                val parts = gfp.split('/', ':').filter { it.isNotBlank() }
+                val fpFields = listOf(
+                    "MANUFACTURER" to parts.getOrNull(0),
+                    "BRAND" to parts.getOrNull(0),
+                    "PRODUCT" to parts.getOrNull(1),
+                    "DEVICE" to parts.getOrNull(2),
+                    "ID" to parts.getOrNull(4),
+                    "INCREMENTAL" to parts.getOrNull(5),
+                )
+                for ((gmsField, fpVal) in fpFields) {
+                    val actual = gms(gmsField)
+                    if (!fpVal.isNullOrBlank() && actual != null &&
+                        !actual.equals(fpVal, ignoreCase = true)) {
+                        violations += CrossFieldViolation(
+                            ruleName = "GMS_FINGERPRINT_VS_$gmsField",
+                            severity = "high",
+                            fields = listOf("gms.FINGERPRINT", "gms.$gmsField"),
+                            values = mapOf("gms.FINGERPRINT.$gmsField" to fpVal, "gms.$gmsField" to actual),
+                            expected = "GMS 档案指纹拆解后 $gmsField 段应等于其 Build.$gmsField",
+                            note = "fingerprint=$gfp",
+                        )
+                    }
+                }
+            }
+
+            // GMS 的 Android release 必须跟随运行时 SDK(物理 13),不能是档案池的 CANARY/14。
+            val gmsSdk = gms("SDK_INT")?.toIntOrNull()
+            val gmsRelease = gms("RELEASE")
+            if (gmsSdk != null && gmsRelease != null) {
+                val expectedRelease = sdkToRelease[gmsSdk]
+                if (expectedRelease != null && !gmsRelease.startsWith(expectedRelease)) {
+                    violations += CrossFieldViolation(
+                        ruleName = "GMS_RELEASE_VS_RUNTIME_SDK",
+                        severity = "high",
+                        fields = listOf("gms.SDK_INT", "gms.RELEASE"),
+                        values = mapOf("gms.SDK_INT" to gmsSdk.toString(), "gms.RELEASE" to gmsRelease),
+                        expected = "GMS SDK=$gmsSdk 对应 Android $expectedRelease",
+                        note = "Google 档案已要求 release 跟随物理运行时",
+                    )
+                }
+            }
+
+            // 描述/指纹/设备码互证。
+            val gmsProduct = gms("PRODUCT")
+            val gmsDevice = gms("DEVICE")
+            val gmsSku = gms("SKU")
+            val gmsDescription = gms("BUILD_DESCRIPTION")
+            if (gmsProduct != null && gmsDescription != null &&
+                !gmsDescription.startsWith("$gmsProduct-user")) {
+                violations += CrossFieldViolation(
+                    ruleName = "GMS_DESCRIPTION_VS_PRODUCT",
+                    severity = "medium",
+                    fields = listOf("gms.BUILD_DESCRIPTION", "gms.PRODUCT"),
+                    values = mapOf("gms.BUILD_DESCRIPTION" to gmsDescription, "gms.PRODUCT" to gmsProduct),
+                    expected = "ro.build.description 应以 \"<product>-user\" 开头",
+                )
+            }
+            if (gmsSku != null && gmsDevice != null && !gmsSku.equals(gmsDevice, ignoreCase = true)) {
+                violations += CrossFieldViolation(
+                    ruleName = "GMS_SKU_VS_DEVICE",
+                    severity = "medium",
+                    fields = listOf("gms.SKU", "gms.DEVICE"),
+                    values = mapOf("gms.SKU" to gmsSku, "gms.DEVICE" to gmsDevice),
+                    expected = "ro.boot.hardware.sku 应等于设备代号",
+                )
+            }
+
+            // USB 拔线伪装在 GMS 进程必须同样成立(不依赖 app 侧采集是否成功)。
+            val gmsUsbConfig = gms("runtime.sys_usb_config")
+            val gmsAdbd = gms("runtime.init_svc_adbd")
+            if ((gmsUsbConfig != null && gmsUsbConfig != "none") ||
+                (gmsAdbd != null && gmsAdbd != "stopped")) {
+                violations += CrossFieldViolation(
+                    ruleName = "GMS_USB_NOT_STOPPED",
+                    severity = "high",
+                    fields = listOf("gms.runtime.sys_usb_config", "gms.runtime.init_svc_adbd"),
+                    values = mapOf(
+                        "gms.runtime.sys_usb_config" to gmsUsbConfig,
+                        "gms.runtime.init_svc_adbd" to gmsAdbd,
+                    ),
+                    expected = "GMS 进程也必须看到 USB 拔线(none/stopped)",
+                    note = "GMS 私有属性区漏了 USB_STOPPED_PROPS",
+                )
+            }
+        }
+
+        return CheckResult(violations, pairs)
     }
+
+    // ========================================================================
+    // PairResult 构造 helpers
+    // ========================================================================
+
+    /** 一侧观测:字段的规范值 + 不可采原因 + 字段名。transform 在归一之后作用于规范值。 */
+    internal data class Side(
+        val field: String,
+        val value: String?,
+        val reason: String?,
+        val gated: Boolean,
+    )
+
+    /** 从字段表取一侧;identity=true 时把 "-1" 也当占位值。 */
+    internal fun side(
+        map: Map<String, FieldResult>,
+        field: String,
+        identity: Boolean = false,
+        transform: ((String) -> String?)? = null,
+    ): Side {
+        val f = map[field]
+        val (norm, reason) = normalizeObserved(f?.canonicalValue, f?.firstError(), identity)
+        val mapped = if (norm != null && transform != null) transform(norm) else norm
+        // transform 把值榨空(如 locale tag 不含国家)→ 视为 empty,不是 MISMATCH。
+        return if (norm != null && mapped.isNullOrEmpty()) Side(field, null, "empty", field in PERMISSION_GATED)
+        else Side(field, mapped, reason, field in PERMISSION_GATED)
+    }
+
+    /** 宽高两字段合成 "<w>x<h>" 一侧;任一侧不可采就整体不可采。 */
+    internal fun sizeSide(map: Map<String, FieldResult>, widthField: String, heightField: String): Side {
+        val w = side(map, widthField)
+        val h = side(map, heightField)
+        val name = "$widthField+$heightField"
+        if (w.value == null || h.value == null) {
+            return Side(name, null, w.reason ?: h.reason ?: "empty", false)
+        }
+        return Side(name, "${w.value}x${h.value}", null, false)
+    }
+
+    /** 宽高无序相等:横竖屏互换算同一块屏。 */
+    internal fun sizeEqual(a: String, b: String): Boolean {
+        fun pair(s: String): Set<String>? =
+            s.split('x').map { it.trim() }.takeIf { it.size == 2 && it.all(String::isNotEmpty) }?.toSet()
+        val pa = pair(a) ?: return a.equals(b, ignoreCase = true)
+        val pb = pair(b) ?: return a.equals(b, ignoreCase = true)
+        return pa == pb
+    }
+
+    /**
+     * 两侧归一后判定状态:
+     * - 任一侧是权限门控字段且不可采,或两侧都不可采 → NOT_COLLECTABLE(永不出 violation)
+     * - 非权限字段一边有值一边不可采 → ONE_SIDED
+     * - 都有值 → MATCH / MISMATCH(默认大小写不敏感比较)
+     */
+    internal fun comparePair(
+        field: String,
+        left: Side,
+        right: Side,
+        gated: Boolean = false,
+        equal: (String, String) -> Boolean = { a, b -> a.equals(b, ignoreCase = true) },
+    ): PairResult {
+        val permissionGated = gated || left.gated || right.gated
+        val status: PairStatus
+        var reason: String? = null
+        when {
+            left.value == null && right.value == null -> {
+                status = PairStatus.NOT_COLLECTABLE
+                reason = left.reason ?: right.reason
+            }
+            left.value == null || right.value == null -> {
+                reason = if (left.value == null) left.reason else right.reason
+                status = if (permissionGated || reason == "permission") PairStatus.NOT_COLLECTABLE
+                else PairStatus.ONE_SIDED
+            }
+            equal(left.value, right.value) -> status = PairStatus.MATCH
+            else -> status = PairStatus.MISMATCH
+        }
+        return PairResult(
+            field = field,
+            leftField = left.field,
+            rightField = right.field,
+            left = left.value,
+            right = right.value,
+            status = status,
+            reason = reason,
+        )
+    }
+
+    /** 非权限字段一边有值一边空:hook 只覆盖了一边,或旧 Ghost 缺键 —— 只记 low,不算身份穿帮。 */
+    internal fun oneSidedViolation(p: PairResult) = CrossFieldViolation(
+        ruleName = "GMS_ONE_SIDED_VALUE",
+        severity = "low",
+        fields = listOf(p.leftField, p.rightField),
+        values = mapOf(p.leftField to p.left, p.rightField to p.right),
+        expected = "${p.field} 两侧应同时可采(同一套 hook 覆盖)",
+        note = "一侧为空(${p.reason ?: "empty"});可能是该侧 hook 未装或 Ghost 版本缺此键",
+    )
 
     /** 型号/厂商字符串 → 规范 OEM 组;未知返 null(不参与,避免误报)。 */
     private fun oemGroup(s: String?): String? {
@@ -1598,5 +2069,100 @@ object CrossFieldChecker {
             expected = "所有 resolution 字段 normalize 后应一致(发现 $distinct)",
             note = note
         ))
+    }
+}
+
+// ============================================================
+// Ghost 期望值(expectedEnv)↔ verify 自身读值
+// ============================================================
+
+/**
+ * `content://com.ghost.call/expectedEnv` 的 expected{} 与本 app 采到的字段逐个比对。
+ * expected 缺键 = Ghost 对该项没有确定期望 → 不比较、不出 pair。
+ * MISMATCH → `APP_VS_EXPECTED`(high);ONE_SIDED / NOT_COLLECTABLE 只记入 baseline.pairs。
+ */
+object ExpectedEnvChecker {
+    /** expected key → app 字段名。宽高、内存、国家等需换算的项单独处理。 */
+    val KEY_TO_APP_FIELD: List<Pair<String, String>> = listOf(
+        "build.manufacturer" to "MANUFACTURER",
+        "build.brand" to "BRAND",
+        "build.board" to "BOARD",
+        "build.device" to "DEVICE",
+        "build.product" to "PRODUCT",
+        "build.model" to "MODEL",
+        "build.host" to "HOST",
+        "build.fingerprint" to "FINGERPRINT",
+        "build.bootloader" to "BOOTLOADER",
+        "build.id" to "ID",
+        "build.displayId" to "DISPLAY",
+        "build.hardware" to "HARDWARE",
+        "build.socModel" to "SOC_MODEL",
+        "build.socManufacturer" to "SOC_MANUFACTURER",
+        "build.sku" to "SKU",
+        "build.release" to "RELEASE",
+        "build.incremental" to "INCREMENTAL",
+        "build.securityPatch" to "SECURITY_PATCH",
+        "build.sdkInt" to "SDK_INT",
+        // Option B:Resources 的 densityDpi 与 Ghost 期望的同一 API 读值比较。
+        "display.densityDpi" to "dpi_app_resources_java",
+        "gl.renderer" to "GL_RENDERER",
+        "gl.vendor" to "GL_VENDOR",
+        "cpuCount" to "cpu_count.available_processors",
+        "uname.release" to "uname.release",
+        "uname.version" to "uname.version",
+        "uname.machine" to "uname.machine",
+        "timezone" to "timezone",
+    )
+
+    private const val MB = 1024L * 1024L
+
+    fun compare(fields: List<FieldResult>, expected: Map<String, String>): CrossFieldChecker.CheckResult {
+        val map = fields.associateBy { it.name }
+        val pairs = mutableListOf<PairResult>()
+
+        fun exp(key: String, transform: ((String) -> String?)? = null): CrossFieldChecker.Side {
+            val (norm, reason) = normalizeObserved(expected[key], null)
+            val v = if (norm != null && transform != null) transform(norm) else norm
+            return CrossFieldChecker.Side("expected.$key", v, if (v == null) reason ?: "empty" else null, false)
+        }
+
+        for ((key, appField) in KEY_TO_APP_FIELD) {
+            if (key !in expected) continue
+            pairs += CrossFieldChecker.comparePair(key,
+                CrossFieldChecker.side(map, appField, identity = true), exp(key))
+        }
+        // 真实屏幕宽高:app 侧 resolution 为 getRealMetrics 的 "HxW",无序比较。
+        val w = expected["display.realWidthPixels"]
+        val h = expected["display.realHeightPixels"]
+        if (w != null && h != null) {
+            val right = CrossFieldChecker.Side(
+                "expected.display.realWidthPixels+realHeightPixels", "${w.trim()}x${h.trim()}", null, false)
+            pairs += CrossFieldChecker.comparePair("display.real_size",
+                CrossFieldChecker.side(map, "resolution"), right, equal = CrossFieldChecker::sizeEqual)
+        }
+        // 内存:期望是字节,app 侧是 MB(整除)。
+        if ("mem.totalMem" in expected) {
+            pairs += CrossFieldChecker.comparePair("mem.totalMem",
+                CrossFieldChecker.side(map, "runtime.total_mem_mb"),
+                exp("mem.totalMem") { it.toLongOrNull()?.div(MB)?.toString() })
+        }
+        // 国家:app 侧从 Locale tag 取;tag 不带国家时为 ONE_SIDED。
+        if ("locale.country" in expected) {
+            pairs += CrossFieldChecker.comparePair("locale.country",
+                CrossFieldChecker.side(map, "locale") { java.util.Locale.forLanguageTag(it).country },
+                exp("locale.country"))
+        }
+
+        val violations = pairs.filter { it.status == PairStatus.MISMATCH }.map { p ->
+            CrossFieldViolation(
+                ruleName = "APP_VS_EXPECTED",
+                severity = "high",
+                fields = listOf(p.leftField, p.rightField),
+                values = mapOf(p.leftField to p.left, p.rightField to p.right),
+                expected = "本进程读到的 ${p.field} 应等于 Ghost expectedEnv 给出的期望值",
+                note = "期望值与实际读值不一致:配置投影错误,或本进程 hook 漏装/串档",
+            )
+        }
+        return CrossFieldChecker.CheckResult(violations, pairs)
     }
 }

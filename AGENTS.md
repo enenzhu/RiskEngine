@@ -34,7 +34,7 @@ adb shell pm grant com.ghost.verify android.permission.{READ,WRITE}_EXTERNAL_STO
 
 ## 关键路径与运维要点(踩坑记录)
 
-- **★采集只由 UI「采集设备信息」按钮或 `--es auto collect` intent extra 触发**(`ghost-verify/.../MainActivity.kt`),脚本化别漏了这个 extra。
+- **★常规采集由 UI「采集设备信息」按钮或 `--es auto collect` intent extra 触发**(`ghost-verify/.../MainActivity.kt`)；恢复字段回归用 `--es auto restore-audit --es audit_run_id <nonce>`，以新报告独立读取系统 API、核对前后身份/收养状态，不写常规缓存。比较器只在本机运行，`PARTIAL` 不算 PASS；用法见 `ghost-verify/README.md`。脚本化别漏采集 extra。
 - **★ghost 设备档案切换后 ghost-verify 会被踢出拦截名单**,`pm enable` 复活无效——必须重新走安装流程让它被收养进当前身份的拦截名单,否则采到的是未拦截/半拦截的值,结论全废。详细坑与正确流程见 `../fakeFramework-hotfix/AGENTS.md` 的「ghost_verify 脚本化采集」节。
 
 ## 与其它仓的关系

@@ -33,6 +33,14 @@ class GhostCollector(
     private val context: Context,
     private val launchReferrer: String? = null,
     private val launchReferrerExplicit: Boolean = false,
+    /** GMS 进程 clone 采集(GmsClone)。null = 未启用/采集失败,`gms.*` 基准字段为 UNAVAILABLE。 */
+    private val gmsClone: GmsClone? = null,
+    /** Ghost `expectedEnv` 给本进程的期望值(key→字符串)。null = 旧 Ghost 不支持/查询失败,不比较。 */
+    private val expectedEnv: Map<String, String>? = null,
+    /** Ghost `expectedEnv` 给 GMS 主进程的 L1 SECURITY_PATCH(Google 共享档案补丁)。 */
+    private val gmsExpectedPatch: String? = null,
+    /** 本地恢复审计只采恢复字段，不执行网络、账号、SDK、密钥或缓存探针。 */
+    private val restoreAuditOnly: Boolean = false,
 ) {
 
     private val fields = mutableListOf<FieldResult>()
@@ -179,7 +187,9 @@ class GhostCollector(
                 "ro.boot.bootloader" nLayer { NativeBridge.getSystemProperty("ro.boot.bootloader") },
             )
             field("RADIO",
-                "Build.RADIO" jLayer { Build.getRadioVersion() ?: Build.RADIO },
+                safeCollect("Build.RADIO", "java", {
+                    if (restoreAuditOnly) Build.getRadioVersion() else Build.getRadioVersion() ?: Build.RADIO
+                }, preserveEmpty = restoreAuditOnly),
                 "gsm.version.baseband" nLayer { NativeBridge.getSystemProperty("gsm.version.baseband") },
                 "ro.build.expect.baseband" nLayer { NativeBridge.getSystemProperty("ro.build.expect.baseband") },
             )
@@ -273,6 +283,36 @@ class GhostCollector(
                     Settings.Global.getString(context.contentResolver, Settings.Global.ADB_ENABLED)
                 },
             )
+            // USB 对 hooked app 必须表现为"拔线"(调试线是跨虚拟身份物理锚,且与恒 DISCHARGING 矛盾)。
+            // Java 面看 UsbManager,原生面看 __system_property_get 的 usb/adbd,两者都要空/停。
+            val usb = runCatching {
+                context.getSystemService(Context.USB_SERVICE) as? android.hardware.usb.UsbManager
+            }.getOrNull()
+            field("USB.device_count",
+                "UsbManager.getDeviceList().size" jLayer { usb?.getDeviceList()?.size?.toString() },
+            )
+            field("USB.port_count",
+                "UsbManager.getPorts().size(reflect)" jLayer {
+                    val m = android.hardware.usb.UsbManager::class.java.getMethod("getPorts")
+                    val v = m.invoke(usb)
+                    val n = (v as? java.util.Collection<*>)?.size() ?: (v as? Map<*, *>)?.size
+                    n?.toString() ?: v?.javaClass?.name
+                },
+            )
+            field("USB.current_functions",
+                "UsbManager.getCurrentFunctions(reflect)" jLayer {
+                    android.hardware.usb.UsbManager::class.java.getMethod("getCurrentFunctions")
+                        .invoke(usb)?.toString()
+                },
+            )
+            field("USB.native_sys_usb_config",
+                "__system_property_get(sys.usb.config)" nLayer { NativeBridge.getSystemProperty("sys.usb.config") },
+                "getprop sys.usb.config" sLayer { getpropShell("sys.usb.config") },
+            )
+            field("USB.native_init_svc_adbd",
+                "__system_property_get(init.svc.adbd)" nLayer { NativeBridge.getSystemProperty("init.svc.adbd") },
+                "getprop init.svc.adbd" sLayer { getpropShell("init.svc.adbd") },
+            )
             field("DEVELOPMENT_SETTINGS_ENABLED",
                 "Settings.Global" jLayer {
                     Settings.Global.getString(context.contentResolver, Settings.Global.DEVELOPMENT_SETTINGS_ENABLED)
@@ -298,6 +338,15 @@ class GhostCollector(
                     "${dm.heightPixels}x${dm.widthPixels}"
                 },
             )
+            if (restoreAuditOnly) {
+                field("dpi_app_resources_java",
+                    "DisplayMetrics.densityDpi" jLayer { context.resources.displayMetrics.densityDpi.toString() })
+                field("restore.display.xdpi",
+                    "Display.getRealMetrics.xdpi" jLayer { realDisplayMetrics().xdpi.toString() })
+                field("restore.display.ydpi",
+                    "Display.getRealMetrics.ydpi" jLayer { realDisplayMetrics().ydpi.toString() })
+                return@category
+            }
             // dpi 分层检查 — ghost 框架是 Option B 双 DPI 世界,Java 层故意保留真机值
             // 避免 density split / resource bucket 切换导致字体/控件观感异常(历史教训 commit 4af2565)
             // 拆成 3 个独立字段,每个有不同预期,不放一起做一致性检查
@@ -792,6 +841,10 @@ class GhostCollector(
             )
             field("cpuinfo.CPUImplementer",
                 "proc cpuinfo" pLayer { extractAllProcValues("/proc/cpuinfo", "CPU implementer") },
+            )
+            // 与 GMS 基准同字段比对:两边必须由同一 CpuCountHook/FakeDevice 表派生。
+            field("cpu_count.available_processors",
+                "Runtime.availableProcessors()" jLayer { Runtime.getRuntime().availableProcessors().toString() },
             )
             // Runtime.exec(getprop) 是独立于进程内 __system_property_get 的读取路径。字段必须与上面的
             // native ro.board.platform 分开命名，否则 CrossFieldChecker.associateBy 会静默覆盖其中一条。
@@ -1421,6 +1474,7 @@ class GhostCollector(
             field("GAID (Google Advertising ID)",
                 "AdvertisingIdClient.Info.getId()" jLayer { reflectGetGaid(context) },
             )
+            if (restoreAuditOnly) return@category
             // Widevine L3 device unique ID — DRM 层硬件 ID
             field("Widevine.deviceUniqueId",
                 "MediaDrm(EDEF8BA9...).getPropertyByteArray" jLayer { widevineDeviceId() },
@@ -1929,6 +1983,21 @@ class GhostCollector(
                     val bm = context.getSystemService(android.content.Context.BATTERY_SERVICE)
                         as? android.os.BatteryManager
                     bm?.isCharging.toString()
+                },
+            )
+            // sticky 广播面:与 BatteryManager 同源但走另一条 API,供 GMS 基准逐项比对。
+            field("battery.status",
+                "ACTION_BATTERY_CHANGED.status" jLayer {
+                    context.registerReceiver(null,
+                        android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+                        ?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1)?.toString()
+                },
+            )
+            field("battery.plugged",
+                "ACTION_BATTERY_CHANGED.plugged" jLayer {
+                    context.registerReceiver(null,
+                        android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED))
+                        ?.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, -1)?.toString()
                 },
             )
 
@@ -3681,10 +3750,137 @@ class GhostCollector(
             )
         }
 
+        // ============================================================
+        // Z. GMS 进程 clone 基准
+        //   同一物理机、GMS 进程内(Google 兼容档案 + GMS 专属 hook)采到的值。普通 app 与 GMS
+        //   身份字段**应当不同**(app=虚拟机型,GMS=Pixel 档案);运行时字段(USB/adb/电池/SDK/CPU)
+        //   必须相同。规则见 CrossFieldChecker 的 GMS_* 段。
+        // ============================================================
+        category("gms") {
+            if (gmsClone == null) {
+                field("gms.available", "collectClone provider" gLayer { null })
+            } else {
+                field("gms.process_pkg", "clone processPkg" gLayer { gmsClone.processPkg })
+                field("gms.process_name", "clone processName" gLayer { gmsClone.processName })
+                // .unstable 的档案快照由 BuildHook 落盘、主进程采集时取走;主进程本身不再带档案。
+                field("gms.profile_probe.present", "profile probe present" gLayer {
+                    gmsClone.str("profileProbe.processName")?.let { "true" }
+                })
+                field("gms.profile_probe.process_name", "profile probe processName" gLayer {
+                    gmsClone.str("profileProbe.processName")
+                })
+                field("gms.profile_probe.applied", "profile probe applied" gLayer {
+                    gmsClone.str("profileProbe.profileApplied")
+                })
+                field("gms.profile_probe.HARDWARE", "profile probe Build.HARDWARE" gLayer {
+                    gmsClone.str("profileProbe.build.HARDWARE")
+                })
+                field("gms.profile_probe.SOC_MODEL", "profile probe Build.SOC_MODEL" gLayer {
+                    gmsClone.str("profileProbe.build.SOC_MODEL")
+                })
+                field("gms.collected_at", "clone collectedAt" gLayer { gmsClone.collectedAt?.toString() })
+                field("gms.MANUFACTURER", "gms Build.MANUFACTURER" gLayer { gmsClone.str("build.manufacturer") })
+                field("gms.BRAND", "gms Build.BRAND" gLayer { gmsClone.str("build.brand") })
+                field("gms.MODEL", "gms Build.MODEL" gLayer { gmsClone.str("build.model") })
+                field("gms.DEVICE", "gms Build.DEVICE" gLayer { gmsClone.str("build.device") })
+                field("gms.PRODUCT", "gms Build.PRODUCT" gLayer { gmsClone.str("build.product") })
+                field("gms.HARDWARE", "gms Build.HARDWARE" gLayer { gmsClone.str("build.hardware") })
+                field("gms.BOARD", "gms Build.BOARD" gLayer { gmsClone.str("build.board") })
+                field("gms.FINGERPRINT", "gms Build.FINGERPRINT" gLayer { gmsClone.str("build.fingerprint") })
+                field("gms.ID", "gms Build.ID" gLayer { gmsClone.str("build.id") })
+                field("gms.INCREMENTAL", "gms Build.VERSION.INCREMENTAL" gLayer { gmsClone.str("build.incremental") })
+                field("gms.SECURITY_PATCH", "gms Build.VERSION.SECURITY_PATCH" gLayer { gmsClone.str("build.securityPatch") })
+                field("gms.RELEASE", "gms Build.VERSION.RELEASE" gLayer { gmsClone.str("build.release") })
+                field("gms.SDK_INT", "gms Build.VERSION.SDK_INT" gLayer { gmsClone.str("build.sdkInt") })
+                field("gms.SOC_MODEL", "gms Build.SOC_MODEL" gLayer { gmsClone.str("build.socModel") })
+                field("gms.SOC_MANUFACTURER", "gms Build.SOC_MANUFACTURER" gLayer { gmsClone.str("build.socManufacturer") })
+                field("gms.SKU", "gms ro.boot.hardware.sku" gLayer { gmsClone.str("build.sku") })
+                field("gms.BUILD_DESCRIPTION", "gms ro.build.description" gLayer { gmsClone.str("build.buildDescription") })
+                field("gms.HOST", "gms Build.HOST" gLayer { gmsClone.str("build.host") })
+                field("gms.BOOTLOADER", "gms Build.BOOTLOADER" gLayer { gmsClone.str("build.bootloader") })
+                field("gms.gl.renderer", "gms GL_RENDERER" gLayer { gmsClone.str("gl.renderer") })
+                field("gms.gl.vendor", "gms GL_VENDOR" gLayer { gmsClone.str("gl.vendor") })
+                field("gms.gpu_family", "gms hwAnchor.gpuFamily" gLayer { gmsClone.str("hwAnchor.gpuFamily") })
+                field("gms.display.width", "gms display.widthPixels" gLayer { gmsClone.str("display.widthPixels") })
+                field("gms.display.height", "gms display.heightPixels" gLayer { gmsClone.str("display.heightPixels") })
+                field("gms.display.density_dpi", "gms display.densityDpi" gLayer { gmsClone.str("display.densityDpi") })
+                field("gms.cpu_count", "gms cpuCount" gLayer { gmsClone.str("cpuCount") })
+                field("gms.runtime.total_mem_mb", "gms mem.totalMem/1MB" gLayer {
+                    gmsClone.str("mem.totalMem")?.toLongOrNull()?.div(1024L * 1024L)?.toString()
+                })
+                field("gms.runtime.adb_enabled", "gms Settings.Global.ADB_ENABLED" gLayer { gmsClone.str("runtimeEnv.adbEnabled") })
+                field("gms.runtime.development_settings_enabled",
+                    "gms Settings.Global.DEVELOPMENT_SETTINGS_ENABLED" gLayer { gmsClone.str("runtimeEnv.developmentSettingsEnabled") })
+                field("gms.runtime.init_svc_adbd", "gms init.svc.adbd" gLayer { gmsClone.str("runtimeEnv.initSvcAdbd") })
+                field("gms.runtime.sys_usb_state", "gms sys.usb.state" gLayer { gmsClone.str("runtimeEnv.sysUsbState") })
+                field("gms.runtime.sys_usb_config", "gms sys.usb.config" gLayer { gmsClone.str("runtimeEnv.sysUsbConfig") })
+                field("gms.runtime.persist_sys_usb_config", "gms persist.sys.usb.config" gLayer { gmsClone.str("runtimeEnv.persistSysUsbConfig") })
+                field("gms.runtime.usb_device_count", "gms UsbManager.getDeviceList().size" gLayer { gmsClone.str("runtimeEnv.usbDeviceCount") })
+                field("gms.runtime.usb_current_functions", "gms UsbManager.getCurrentFunctions" gLayer { gmsClone.str("runtimeEnv.usbCurrentFunctions") })
+                field("gms.battery.status", "gms ACTION_BATTERY_CHANGED.status" gLayer { gmsClone.str("runtimeEnv.batteryStatus") })
+                field("gms.battery.plugged", "gms ACTION_BATTERY_CHANGED.plugged" gLayer { gmsClone.str("runtimeEnv.batteryPlugged") })
+                field("gms.battery.is_charging", "gms BatteryManager.isCharging()" gLayer { gmsClone.str("runtimeEnv.batteryCharging") })
+                // 扩大基准:真实屏幕尺寸 / 内核 / 地区 / GLES 版本。旧 Ghost 缺键 → null(该对 ONE_SIDED 或 UNAVAILABLE)。
+                field("gms.display.real_width", "gms display.realWidthPixels" gLayer { gmsClone.str("display.realWidthPixels") })
+                field("gms.display.real_height", "gms display.realHeightPixels" gLayer { gmsClone.str("display.realHeightPixels") })
+                field("gms.uname.release", "gms uname.release" gLayer { gmsClone.str("uname.release") })
+                field("gms.uname.machine", "gms uname.machine" gLayer { gmsClone.str("uname.machine") })
+                field("gms.locale.country", "gms locale.country" gLayer { gmsClone.str("locale.country") })
+                field("gms.timezone", "gms TimeZone.getDefault" gLayer { gmsClone.str("timezone") })
+                field("gms.req_gl_es_version", "gms reqGlEsVersion" gLayer { gmsClone.str("reqGlEsVersion") })
+                // taken | unstable_not_running | absent;旧 Ghost 无此键。
+                field("gms.profile_probe.state", "clone profileProbeState" gLayer { gmsClone.str("profileProbeState") })
+                field("gms.expected.security_patch", "Ghost expectedEnv(gms).build.securityPatch" gLayer { gmsExpectedPatch })
+                // 权限门控标识:只记"有值/无值",值本身不进报告。
+                for (key in listOf("imei", "meid", "serialno")) {
+                    field("gms.telephony.$key", "gms rootReserved.$key (presence)" gLayer {
+                        normalizeObserved(gmsClone.str("rootReserved.$key"), null, identity = true)
+                            .first?.let { "present" }
+                    })
+                }
+            }
+        }
+
         // 风控 SDK 视角的物理机/家族聚集性探针。只读 framework、/proc、/sys，
         // 不把跨报告结论硬编码进单份报告；由显式 physical/identity 分组工具判定。
-        ClusteringProbe.collect(context).forEach { probe ->
+        if (!restoreAuditOnly) ClusteringProbe.collect(context).forEach { probe ->
             fields += FieldResult.build(probe.name, probe.category, probe.sources)
+        }
+        if (restoreAuditOnly) category("restore-audit") {
+            field("restore.total_memory_bytes", "ActivityManager.MemoryInfo.totalMem" jLayer {
+                val am = context.getSystemService(Context.ACTIVITY_SERVICE) as android.app.ActivityManager
+                val info = android.app.ActivityManager.MemoryInfo()
+                am.getMemoryInfo(info)
+                info.totalMem.toString()
+            })
+            field("restore.disk_bytes", "StatFs.external_storage.total_bytes" jLayer {
+                android.os.StatFs(android.os.Environment.getExternalStorageDirectory().path).totalBytes.toString()
+            })
+            field("restore.slibs", "PackageManager.getSystemSharedLibraryNames" jLayer {
+                context.packageManager.systemSharedLibraryNames?.joinToString(",")
+            })
+            val audio = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            for ((stream, key) in listOf("vol_vc", "vol_sys", "vol_ring", "vol_music", "vol_alarm", "vol_notif").withIndex()) {
+                field("restore.$key", "AudioManager.getStreamVolume($stream)" jLayer { audio.getStreamVolume(stream).toString() })
+            }
+            field("restore.sensorMap", "SensorManager.default_sensors" jLayer {
+                val manager = context.getSystemService(Context.SENSOR_SERVICE) as android.hardware.SensorManager
+                val sensors = manager.getSensorList(android.hardware.Sensor.TYPE_ALL)
+                    .map { it.type }.distinct().mapNotNull { type ->
+                        manager.getDefaultSensor(type)?.let { sensor -> type.toString() to mapOf(
+                            "name" to sensor.name, "vendor" to sensor.vendor,
+                            "maxRange" to sensor.maximumRange, "resolution" to sensor.resolution) }
+                    }.toMap()
+                com.google.gson.Gson().toJson(sensors)
+            })
+            val locale = context.resources.configuration.locales[0]
+            field("restore.locale", "Resources.Configuration.locale" jLayer {
+                com.google.gson.Gson().toJson(mapOf(
+                    "language" to locale.language, "country" to locale.country, "variant" to locale.variant))
+            })
+            field("restore.localeStr", "Resources.Configuration.locale" jLayer {
+                "${locale.language}/${locale.country}/${locale.variant}"
+            })
         }
 
         // ============================================================
@@ -3693,7 +3889,12 @@ class GhostCollector(
         val timestamp = System.currentTimeMillis()
         val ts = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date(timestamp))
         val fieldSnapshot = fields.toList()
-        val crossViolations = CrossFieldChecker.run(fieldSnapshot)
+        val checked = if (restoreAuditOnly) CrossFieldChecker.CheckResult(emptyList(), emptyList())
+            else CrossFieldChecker.evaluate(fieldSnapshot)
+        // Ghost 期望值 ↔ verify 自身读值(APP_VS_EXPECTED);expectedEnv 为空(旧 Ghost/失败)时不比。
+        val expectedChecked = expectedEnv?.let { ExpectedEnvChecker.compare(fieldSnapshot, it) }
+        val crossViolations = checked.violations + (expectedChecked?.violations ?: emptyList())
+        val basePairs = checked.pairs + (expectedChecked?.pairs ?: emptyList())
         val clusteringSignals = ClusteringSignalCatalog.build(fieldSnapshot)
         return CollectReport(
             timestamp = timestamp,
@@ -3701,10 +3902,18 @@ class GhostCollector(
             sessionId = "${Build.SERIAL.take(6)}_$ts",
             deviceLabel = "${Build.MANUFACTURER}/${Build.MODEL} (${Build.DEVICE})",
             fieldCount = fields.size,
-            inconsistentCount = fields.count { !it.consistent } + crossViolations.size,
+            // info 级(如 GMS_PROFILE_PROBE_NOT_RUN)只是说明,不计入不一致数。
+            inconsistentCount = fields.count { !it.consistent } + crossViolations.count { it.severity != "info" },
             fields = fieldSnapshot,
             crossFieldViolations = crossViolations,
             clusteringSignals = clusteringSignals,
+            observationContext = ObservationContext(
+                packageName = context.packageName,
+                processName = android.app.Application.getProcessName(),
+                uid = android.os.Process.myUid(),
+                pid = android.os.Process.myPid(),
+            ),
+            baseline = BaselineReport(basePairs),
         )
     }
 
@@ -3715,9 +3924,17 @@ class GhostCollector(
 
     companion object {
         private const val GHOST_PACKAGE = "com.tt.hi"
+        private val RESTORE_CATEGORIES = setOf(
+            "build", "version", "settings", "display", "kernel", "hw", "gpu", "telephony", "misc", "device-ids", "restore-audit")
+    }
+
+    @Suppress("DEPRECATION")
+    private fun realDisplayMetrics(): DisplayMetrics = DisplayMetrics().also {
+        (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealMetrics(it)
     }
 
     private fun category(name: String, block: () -> Unit) {
+        if (restoreAuditOnly && name !in RESTORE_CATEGORIES) return
         currentCategory = name
         block()
     }
@@ -3739,12 +3956,22 @@ class GhostCollector(
     private inline infix fun String.pLayer(crossinline block: () -> String?): SourceValue =
         safeCollect(this, "proc", block)
 
-    private inline fun safeCollect(source: String, layer: String, block: () -> String?): SourceValue {
+    /** GMS 进程 clone 基准(同一物理机、另一进程的 hook 视角)。 */
+    private inline infix fun String.gLayer(crossinline block: () -> String?): SourceValue =
+        safeCollect(this, "gms", block)
+
+    private inline fun safeCollect(
+        source: String, layer: String, block: () -> String?, preserveEmpty: Boolean = false,
+    ): SourceValue {
         return try {
             val v = block()
-            SourceValue(source, layer, v?.ifEmpty { null })
+            // Wi-Fi 设备的 RADIO 成功空串属于恢复值；只在该审计来源显式保留。
+            SourceValue(source, layer, if (preserveEmpty) v else v?.ifEmpty { null })
         } catch (t: Throwable) {
-            SourceValue(source, layer, null, error = t.javaClass.simpleName + ":" + t.message)
+            // Reflection wraps the real failure(SecurityException, ClassCastException…) in
+            // InvocationTargetException whose message is null; report the cause instead.
+            val real = if (t is java.lang.reflect.InvocationTargetException && t.cause != null) t.cause!! else t
+            SourceValue(source, layer, null, error = real.javaClass.simpleName + ":" + real.message)
         }
     }
 
