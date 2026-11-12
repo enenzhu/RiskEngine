@@ -1474,6 +1474,10 @@ class GhostCollector(
             field("GAID (Google Advertising ID)",
                 "AdvertisingIdClient.Info.getId()" jLayer { reflectGetGaid(context) },
             )
+            // GSF 是 restore-audit 的新身份字段,必须在早退前采集。
+            field("GSF Android ID",
+                "gservices.android_id" jLayer { reflectGetGsfAndroidId(context) },
+            )
             if (restoreAuditOnly) return@category
             // Widevine L3 device unique ID — DRM 层硬件 ID
             field("Widevine.deviceUniqueId",
@@ -1484,10 +1488,6 @@ class GhostCollector(
             )
             field("Widevine.securityLevel",
                 "MediaDrm.getPropertyString(securityLevel)" jLayer { widevineProperty("securityLevel") },
-            )
-            // GSF Android ID — com.google.android.gsf.gservices 的 android_id(跟 Settings.Secure.ANDROID_ID 不同)
-            field("GSF Android ID",
-                "gservices.android_id" jLayer { reflectGetGsfAndroidId(context) },
             )
             // OAID — 国内厂商联盟 ID(华为/小米/OPPO/VIVO 各家 SDK 不同,这里探测类是否存在)
             field("OAID provider available",
@@ -3762,6 +3762,27 @@ class GhostCollector(
             } else {
                 field("gms.process_pkg", "clone processPkg" gLayer { gmsClone.processPkg })
                 field("gms.process_name", "clone processName" gLayer { gmsClone.processName })
+                field("gms.sysfs_net", "clone platformProbe.sysfsNet(/sys/class/net)" gLayer {
+                    gmsClone.str("platformProbe.sysfsNet")
+                })
+                field("gms.sysfs_battery", "clone platformProbe.sysfsBattery(power_supply)" gLayer {
+                    gmsClone.str("platformProbe.sysfsBattery")
+                })
+                field("gms.sysfs_net_error", "clone platformProbe.sysfsNetError" gLayer {
+                    gmsClone.str("platformProbe.sysfsNetError")
+                })
+                field("gms.sysfs_net_diag", "clone platformProbe.sysfsNetDiag(诊断)" gLayer {
+                    gmsClone.str("platformProbe.sysfsNetDiag")
+                })
+                field("gms.proc_net_dev_hits", "clone platformProbe.procNetDevHits(/proc/net/dev eth0|wlan0)" gLayer {
+                    gmsClone.str("platformProbe.procNetDevHits")
+                })
+                field("gms.proc_net_route", "clone platformProbe.procNetRoute(/proc/net/route)" gLayer {
+                    gmsClone.str("platformProbe.procNetRoute")
+                })
+                field("gms.log_read_probe", "clone platformProbe.logReadProbe(LogcatHook 过滤探针)" gLayer {
+                    gmsClone.str("platformProbe.logReadProbe")
+                })
                 // .unstable 的档案快照由 BuildHook 落盘、主进程采集时取走;主进程本身不再带档案。
                 field("gms.profile_probe.present", "profile probe present" gLayer {
                     gmsClone.str("profileProbe.processName")?.let { "true" }

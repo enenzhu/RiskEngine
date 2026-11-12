@@ -77,9 +77,9 @@ RULES.update({
     "extraData.disp_ydpi": Rule("restore.display.ydpi", "Display.getRealMetrics.ydpi", kind="number"),
     "extraData.cpu_count": Rule("cpu_count.available_processors", "Runtime.availableProcessors()", kind="number"),
     "props.version_codename": Rule("CODENAME", "Build.VERSION.CODENAME"),
-    "props.gl_vendor": Rule("GL_VENDOR", "native EGL + glGetString", "native"),
+    "props.gl_vendor": Rule("GL_VENDOR", "native eglMakeCurrent + glGetString", "native"),
     "props.gl_version": Rule("GL_VERSION", "native EGL + glGetString", "native"),
-    "props.gsf_android_id": Rule("GSF Android ID", "gservices.android_id"),
+    "props.gsf_android_id": Rule("GSF Android ID", "gservices.android_id", kind="gsf"),
 })
 for key in ("simOperator", "simOperatorName", "simCountryIso"):
     RULES[f"props.{key}"] = Rule(key, f"TelephonyManager.{key}")
@@ -149,6 +149,16 @@ def normalize(value, kind, observed=False):
         if not isinstance(value, str) or not value.strip():
             raise ValueError("not_text")
         return re.sub(r"^soc/", "", value.strip())
+    if kind == "gsf":
+        # 快照存十进制;观测端 Long.toHexString 输出十六进制,同值不同写法必须相等。
+        if not isinstance(value, str):
+            raise ValueError("not_text")
+        text = value.strip().lower()
+        if text.startswith("0x"):
+            text = text[2:]
+        if not text:
+            raise ValueError("not_text")
+        return int(text, 16 if re.search(r"[a-f]", text) else 10)
     if kind in {"number", "epoch_seconds", "width", "height"}:
         if observed and kind in {"width", "height"}:
             dims = normalize(value, "size")

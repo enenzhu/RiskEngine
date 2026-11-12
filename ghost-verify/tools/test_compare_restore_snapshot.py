@@ -189,6 +189,22 @@ class CompareRestoreSnapshotTest(unittest.TestCase):
         self.assertEqual("PASS", row["status"])
         self.assertEqual("PASS", result["verdict"])
 
+    def test_gsf_decimal_snapshot_and_hex_observation_are_equal(self):
+        snapshot, report = fixture()
+        snapshot["device"]["props"]["gsf_android_id"] = "3724571759948816634"
+        add_field(report, "GSF Android ID", "gservices.android_id", "33b05648343360fa")
+        result = compare(snapshot, report)
+        row = next(row for row in result["fields"] if row["field"] == "props.gsf_android_id")
+        self.assertEqual("PASS", row["status"])
+
+    def test_gsf_different_value_is_mismatch(self):
+        snapshot, report = fixture()
+        snapshot["device"]["props"]["gsf_android_id"] = "3724571759948816634"
+        add_field(report, "GSF Android ID", "gservices.android_id", "33b05648343360fb")
+        result = compare(snapshot, report)
+        row = next(row for row in result["fields"] if row["field"] == "props.gsf_android_id")
+        self.assertEqual("MISMATCH", row["status"])
+
     def test_real_producer_library_missing_from_observer_is_mismatch(self):
         snapshot, report = fixture()
         snapshot["device"]["extraData"] = {"slibs": "android.test.base org.apache.http.legacy android.test.mock"}

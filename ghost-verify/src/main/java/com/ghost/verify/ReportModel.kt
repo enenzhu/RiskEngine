@@ -809,6 +809,48 @@ object CrossFieldChecker {
                 )
             }
         }
+        // (7) 内核 sysfs 事实泄漏(DroidGuard 原生路径,API hook 之下):
+        map["gms.sysfs_net"]?.canonicalValue?.let { v ->
+            if (v.lowercase().contains("eth0=")) {
+                violations += CrossFieldViolation(
+                    ruleName = "SYSFS_NET_ETH0_LEAK", severity = "high",
+                    fields = listOf("gms.sysfs_net"),
+                    values = mapOf("gms.sysfs_net" to v),
+                    expected = "GMS 视角 /sys/class/net 不应出现 eth0(有线网卡需改名 wlan2 或 sysfs 投影)",
+                    note = "DroidGuard 原生 opendir(/sys/class/net) 直接读内核事实;ConnectivityManager/NetworkInterface hook 覆盖不到"
+                )
+            }
+        }
+        // (8) sysfs 电源事实 vs fake 充电状态:USB 在位/在线但 API 说未充电 = 内核层穿帮
+        run {
+            val sb = map["gms.sysfs_battery"]?.canonicalValue
+            if (sb != null) {
+                val usbPresent = Regex("usb_present=(\\d)").find(sb)?.groupValues?.get(1)
+                val usbOnline = Regex("usb_online=(\\d)").find(sb)?.groupValues?.get(1)
+                val charging = map["gms.battery.is_charging"]?.canonicalValue
+                if ((usbPresent == "1" || usbOnline == "1") && charging == "false") {
+                    violations += CrossFieldViolation(
+                        ruleName = "SYSFS_USB_PRESENT_LEAK", severity = "medium",
+                        fields = listOf("gms.sysfs_battery", "gms.battery.is_charging"),
+                        values = mapOf("gms.sysfs_battery" to sb, "gms.battery.is_charging" to charging),
+                        expected = "battery fake 未充电时,内核 power_supply/usb present|online 应为 0",
+                        note = "DG 原生读 /sys/class/power_supply/*:插着电源但 API 返回未充电 = 内核层泄漏"
+                    )
+                }
+                val sysCap = Regex("capacity=(\\d+)").find(sb)?.groupValues?.get(1)
+                val level = map["battery.level"]?.canonicalValue
+                if (sysCap != null && level != null && sysCap != level) {
+                    violations += CrossFieldViolation(
+                        ruleName = "SYSFS_BATTERY_CAPACITY_MISMATCH", severity = "medium",
+                        fields = listOf("gms.sysfs_battery", "battery.level"),
+                        values = mapOf("gms.sysfs_battery" to sb, "battery.level" to level),
+                        expected = "内核 capacity 与 BatteryManager 假 level 一致",
+                        note = "kernel power_supply capacity 未投影 = DG 原生 read 可读到真实电量"
+                    )
+                }
+            }
+        }
+
         // (0) NetworkInterface 缺 loopback = 物理不可能 —— 但只在**枚举成功**时才判。
         //     ★Android 11+ 对 untrusted_app 限制 getifaddrs/netlink(隐私,防 MAC/网卡指纹)→
         //     getNetworkInterfaces() 抛 "getifaddrs failed: EACCES" = 真机任何 app 的正常行为,不是 ghost 穿帮。
@@ -2107,6 +2149,8 @@ object ExpectedEnvChecker {
         "display.densityDpi" to "dpi_app_resources_java",
         "gl.renderer" to "GL_RENDERER",
         "gl.vendor" to "GL_VENDOR",
+        "gl.version" to "GL_VERSION",
+        "gl.glslVersion" to "GL_SHADING_LANGUAGE_VERSION",
         "cpuCount" to "cpu_count.available_processors",
         "uname.release" to "uname.release",
         "uname.version" to "uname.version",
