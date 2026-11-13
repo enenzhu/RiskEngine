@@ -3783,6 +3783,9 @@ class GhostCollector(
                 field("gms.log_read_probe", "clone platformProbe.logReadProbe(LogcatHook 过滤探针)" gLayer {
                     gmsClone.str("platformProbe.logReadProbe")
                 })
+                field("gms.log_exec_probe", "clone platformProbe.logExecProbe(exec logcat 过滤探针)" gLayer {
+                    gmsClone.str("platformProbe.logExecProbe")
+                })
                 // .unstable 的档案快照由 BuildHook 落盘、主进程采集时取走;主进程本身不再带档案。
                 field("gms.profile_probe.present", "profile probe present" gLayer {
                     gmsClone.str("profileProbe.processName")?.let { "true" }
